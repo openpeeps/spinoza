@@ -107,6 +107,42 @@ proc boxListCommand*(v: Values) =
   initSpinoza()
   boxModule.listBoxes()
 
+proc reloadCommand*(v: Values) =
+  initSpinoza()
+  let vmName =
+    if v.has("vmName"): v.get("vmName").getStr
+    else: ""
+  if vmName.len > 0:
+    let state = loadVmState(vmName)
+    vmModule.reloadFromStore(state)
+  else:
+    let config = loadVmConfig()
+    vmModule.reload(config)
+
+proc suspendCommand*(v: Values) =
+  initSpinoza()
+  let vmName =
+    if v.has("vmName"): v.get("vmName").getStr
+    else: ""
+  if vmName.len > 0:
+    let state = loadVmState(vmName)
+    vmModule.suspendFromStore(state)
+  else:
+    let config = loadVmConfig()
+    vmModule.suspend(config)
+
+proc resumeCommand*(v: Values) =
+  initSpinoza()
+  let vmName =
+    if v.has("vmName"): v.get("vmName").getStr
+    else: ""
+  if vmName.len > 0:
+    let state = loadVmState(vmName)
+    vmModule.resumeFromStore(state)
+  else:
+    let config = loadVmConfig()
+    vmModule.resume(config)
+
 when isMainModule:
   import pkg/kapsis
 
@@ -121,8 +157,14 @@ when isMainModule:
         ## Boot a VM from the Spinozafile (or named VM from registry)
       halt ?string(vmName), ?bool("--force"):
         ## Gracefully shut down the running VM
+      reload ?string(vmName):
+        ## Reload VM config and restart
       destroy ?string(vmName):
         ## Destroy the VM and remove its definition
+      suspend ?string(vmName):
+        ## Suspend a running VM (pause in RAM)
+      resume ?string(vmName):
+        ## Resume a suspended VM
       ssh ?string(vmName):
         ## Connect to the VM via SSH
       status:

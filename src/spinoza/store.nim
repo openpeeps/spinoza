@@ -5,7 +5,7 @@
 #          Made by Humans from OpenPeeps
 #          https://github.com/openpeeps/spinoza
 
-import std/[json, os, options, strutils]
+import std/[json, options, strutils]
 import boogie/stores/kv
 import pkg/openparser/uuid
 

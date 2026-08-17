@@ -11,14 +11,30 @@ import libssh2
 import ./config
 import ./store
 
-proc waitForSsh*(port: int, timeoutSec = 120): bool =
+proc probeSsh*(port: int, user, pass: string, timeoutSec = 120): bool =
+  ## Attempt an actual SSH handshake + auth to verify the VM is ready.
+  ## Returns true once a full auth succeeds, false on timeout.
+  discard libssh2.init(0)
+  defer: libssh2.exit()
+
   let deadline = now() + initDuration(seconds = timeoutSec)
   while now() < deadline:
     var sock = newSocket()
     try:
       sock.connect("127.0.0.1", Port(port))
+      let sockFd = sock.getFd()
+
+      var session = sessionInit()
+      if session.sessionHandshake(sockFd) == 0:
+        if session.userauthPassword(user, pass, nil) == 0:
+          discard session.sessionDisconnect("probe")
+          discard session.sessionFree()
+          sock.close()
+          return true
+        discard session.sessionDisconnect("probe")
+        discard session.sessionFree()
+
       sock.close()
-      return true
     except CatchableError:
       discard
     sleep(3000)
@@ -47,9 +63,6 @@ proc waitsocket(sockFd: SocketHandle, session: Session): cint =
   result = select(cint(sockFd) + 1, readFds, writeFds, nil, addr timeout)
 
 proc ssh*(config: SpinozaConfig) =
-  if not waitForSsh(config.ssh_config.port):
-    raise newException(IOError, "SSH on port " & $config.ssh_config.port & " never became reachable")
-
   let hostname = "127.0.0.1"
   let port = config.ssh_config.port
   let username = config.ssh_config.user
@@ -159,9 +172,6 @@ proc ssh*(config: SpinozaConfig) =
           stdinClosed = true
 
 proc sshFromStore*(state: VmState) =
-  if not waitForSsh(state.sshPort):
-    raise newException(IOError, "SSH on port " & $state.sshPort & " never became reachable")
-
   let hostname = "127.0.0.1"
   let port = state.sshPort
   let username = state.sshUser
