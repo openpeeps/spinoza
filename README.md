@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/openpeeps/spinoza/blob/main/.github/spinoza-logo.png" width="60px"><br>
+  <img src="https://github.com/openpeeps/spinoza/blob/main/.github/spinoza-logo.png" width="120px"><br>
   Spinoza – Spin up Virtual Machines like a PRO<br>
   A super lightweight alternative to Vagrant, VMWare or VirtualBox
 </p>
@@ -20,7 +20,7 @@ Spinoza is a lightweight, fast VM manager written in [Nim](https://nim-lang.org)
 Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to libvirt, no intermediary layers, no heavy dependencies. It works with any qcow2 box image compatible with libvirt (including Vagrant boxes for the libvirt provider).
 
 ## Key Features
-
+- Super fast and easy to use
 - **Single-file configuration** `Spinozafile` in YAML defines your VM specs
 - **Libvirt + QEMU backend** direct integration with the Linux virtualization stack
 - **Built-in SSH** interactive shell sessions via libssh2, no external `ssh` or `expect` needed
@@ -29,7 +29,6 @@ Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to li
 - **QEMU TCG fallback** works on macOS without hardware acceleration
 - **Real-time boot output** tails QEMU log during VM startup
 - **Flysystem-backed storage** atomic file operations for boxes and VM state
-- **Written in Nim** single binary, no runtime dependencies beyond libvirt/libssh2
 
 ### Prerequisites
 You will need to install `libvirt`, `QEMU`,  and `libssh2`.
