@@ -32,30 +32,20 @@ Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to li
 - **Written in Nim** single binary, no runtime dependencies beyond libvirt/libssh2
 
 ### Prerequisites
+You will need to install `libvirt`, `QEMU`,  and `libssh2`.
 
-| Dependency | macOS (MacPorts) | Ubuntu/Debian |
-|---|---|---|
-| libvirt | `port install libvirt` | `apt install libvirt-dev` |
-| libssh2 | `port install libssh2` | `apt install libssh2-1-dev` |
-| QEMU | `port install qemu` | `apt install qemu-system` |
-| libvirt daemon | `port install libvirt` | `apt install libvirtd` |
+> [!NOTE]
+> Browse available boxes on [HashiCorp Cloud](https://portal.cloud.hashicorp.com). For example, [Generic Boxes](https://portal.cloud.hashicorp.com/vagrant/discover/generic) with libvirt support work seamlessly with Spinoza.
 
 ## Quick Start
 
-**1. Create a Spinozafile**
+**1. Initialize a Spinozafile**
 
-```yaml
-box: debian-11
-name: myproject
-memory: 2048
-cpus: 2
-network:
-  subnet: 192.168.122
-ssh_config:
-  port: 2222
-  user: vagrant
-  password: vagrant
+```bash
+spinoza init
 ```
+
+This will interactively prompt for box name, VM name, memory, CPUs, and SSH settings.
 
 **2. Add a box image**
 
@@ -83,12 +73,20 @@ spinoza halt
 
 ## Commands
 
+### Setup
+
+| Command | Description |
+|---|---|
+| `spinoza init` | Create a Spinozafile in the current directory |
+
 ### Virtual Machines
 
 | Command | Description |
 |---|---|
 | `spinoza up` | Boot a VM from the Spinozafile |
+| `spinoza up <name>` | Boot a named VM from the registry |
 | `spinoza halt` | Gracefully shut down the running VM |
+| `spinoza halt <name>` | Shut down a named VM |
 | `spinoza halt --force` | Force power-off the VM |
 | `spinoza destroy` | Destroy the VM and remove its definition |
 | `spinoza ssh` | Connect to the VM via interactive SSH |
@@ -141,6 +139,8 @@ spinoza CLI (kapsis)
     │
     ├── config.nim    ── Spinozafile YAML parsing (openparser)
     ├── paths.nim     ── Filesystem layout (flysystem)
+    ├── store.nim     ── VM registry (boogie KV store)
+    ├── init.nim      ── Interactive Spinozafile creation
     ├── vm.nim        ── Domain lifecycle (libvirt)
     ├── network.nim   ── NAT network management (libvirt)
     ├── ssh.nim       ── Interactive SSH sessions (libssh2)

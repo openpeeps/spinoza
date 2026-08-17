@@ -9,6 +9,7 @@ import std/[net, os, posix, termios, times, terminal]
 import libssh2
 
 import ./config
+import ./store
 
 proc waitForSsh*(port: int, timeoutSec = 120): bool =
   let deadline = now() + initDuration(seconds = timeoutSec)
@@ -132,6 +133,104 @@ proc ssh*(config: SpinozaConfig) =
         break
 
     # Read stdin → channel (POSIX poll on fd 0 only)
+    if not stdinClosed:
+      var stdinPoll: TPollfd
+      stdinPoll.fd = cint(0)
+      stdinPoll.events = POLLIN
+      stdinPoll.revents = 0
+      if posix.poll(addr stdinPoll, 1, 0) > 0:
+        let n = read(0, addr buf[0], 4096)
+        if n > 0:
+          var written = 0
+          while written < n:
+            let rc = channel.channelWrite(cast[cstring](addr buf[written]), n - written)
+            if rc > 0:
+              written += rc
+            elif rc == 0:
+              stdinClosed = true
+              break
+            else:
+              let err = session.sessionLastErrno()
+              if err != LIBSSH2_ERROR_EAGAIN:
+                stdinClosed = true
+              break
+        elif n == 0:
+          discard channel.channelSendEof()
+          stdinClosed = true
+
+proc sshFromStore*(state: VmState) =
+  if not waitForSsh(state.sshPort):
+    raise newException(IOError, "SSH on port " & $state.sshPort & " never became reachable")
+
+  let hostname = "127.0.0.1"
+  let port = state.sshPort
+  let username = state.sshUser
+  let password = state.sshPass
+
+  discard libssh2.init(0)
+  defer: libssh2.exit()
+
+  var sock = newSocket()
+  defer: sock.close()
+  sock.connect(hostname, Port(port))
+  let sockFd = sock.getFd()
+
+  var session = sessionInit()
+  if session.sessionHandshake(sockFd) != 0:
+    raise newException(IOError, "SSH handshake failed")
+  defer:
+    discard session.sessionDisconnect("bye")
+    discard session.sessionFree()
+
+  if session.userauthPassword(username, password, nil) != 0:
+    raise newException(IOError, "SSH authentication failed for " & username)
+
+  var channel = session.channelOpenSession()
+  if channel.isNil:
+    raise newException(IOError, "Failed to open SSH channel")
+  defer: discard channel.channelFree()
+
+  let (cols, rows) = getTerminalSize()
+  if channel.channelRequestPty("xterm-256color") != 0:
+    raise newException(IOError, "Failed to request PTY")
+  discard channel.channelRequestPtySize(cols, rows)
+
+  if channel.channelShell() != 0:
+    raise newException(IOError, "Failed to request shell")
+
+  var origTerm: Termios
+  discard tcGetAttr(0, addr origTerm)
+  defer: discard tcSetAttr(0, TCSANOW, addr origTerm)
+
+  var rawTerm = origTerm
+  rawTerm.c_lflag = rawTerm.c_lflag and not (ECHO or ICANON or IEXTEN or ISIG)
+  rawTerm.c_iflag = rawTerm.c_iflag and not (IXON or ICRNL or BRKINT or INLCR or IGNBRK or PARMRK or ISTRIP or IGNCR)
+  rawTerm.c_oflag = rawTerm.c_oflag or OPOST
+  rawTerm.c_cc[VMIN] = '\1'
+  rawTerm.c_cc[VTIME] = '\0'
+  discard tcSetAttr(0, TCSANOW, addr rawTerm)
+
+  channel.channelSetBlocking(0)
+  session.sessionSetBlocking(0)
+
+  var buf: array[4096, char]
+  var stdinClosed = false
+
+  while true:
+    discard waitsocket(sockFd, session)
+
+    while true:
+      let rc = channel.channelRead(addr buf[0], 4096)
+      if rc > 0:
+        discard write(1, addr buf[0], rc)
+      elif rc == 0:
+        return
+      else:
+        let err = session.sessionLastErrno()
+        if err != LIBSSH2_ERROR_EAGAIN:
+          return
+        break
+
     if not stdinClosed:
       var stdinPoll: TPollfd
       stdinPoll.fd = cint(0)

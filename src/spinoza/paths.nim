@@ -39,3 +39,8 @@ proc findConfig*(dir: string = getCurrentDir()): string =
   let path = dir / defaultConfigName
   if fileExists(path): path
   else: ""
+
+proc vmDbPath*(): string =
+  let base = getHomeDir() / spinozaDirName / vmsDirName
+  createDir(base)
+  base / "spinoza"
