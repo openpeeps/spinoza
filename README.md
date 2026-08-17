@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://github.com/openpeeps/spinoza/blob/main/.github/spinoza-logo.png" width="120px"><br>
   Spinoza – Spin up Virtual Machines like a PRO<br>
-  A super lightweight alternative to Vagrant, VMware or VirtualBox
+  A super lightweight alternative to Vagrant, VMWare or VirtualBox
 </p>
 
 <p align="center">
@@ -19,19 +19,23 @@ Spinoza is a lightweight, fast VM manager written in [Nim](https://nim-lang.org)
 
 Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to libvirt, no intermediary layers, no heavy dependencies. It works with any qcow2 box image compatible with libvirt (including Vagrant boxes for the libvirt provider).
 
+> [!NOTE]
+> Spinoza is still in progress. Core VM lifecycle (up, halt, reload, destroy, suspend, resume), SSH, and box management are working. Some features like KVM auto-detection and NAT networking via virtnetworkd are not yet available on all platforms.
+
 ## Key Features
 - Super fast and easy to use
 - **Single-file configuration** `Spinozafile` in YAML defines your VM specs
-- **Libvirt + QEMU backend** direct integration with the Linux virtualization stack
+- **Libvirt + QEMU backend** direct integration with the virtualization stack
 - **Built-in SSH** interactive shell sessions via libssh2, no external `ssh` or `expect` needed
-- **NAT networking** automatic subnet allocation with DHCP via libvirt
-- **Box management** download, list, and remove qcow2 box images
-- **QEMU TCG fallback** works on macOS without hardware acceleration
-- **Real-time boot output** tails QEMU log during VM startup
+- **VM registry** named VMs stored in a local boogie KV store
+- **Full VM lifecycle** boot, halt, reload, destroy, suspend, and resume
+- **Box management** download, list, and remove qcow2 box images (local files and URLs)
+- **Memory validation** enforces minimum 1 GB, checks against host RAM, warns at 70% usage
+- **QEMU TCG fallback** auto-generated wrapper on macOS when hardware acceleration is unavailable
 - **Flysystem-backed storage** atomic file operations for boxes and VM state
 
 ### Prerequisites
-You will need to install `libvirt`, `QEMU`,  and `libssh2`.
+You will need to install `libvirt`, `QEMU`, and `libssh2`.
 
 > [!NOTE]
 > Browse available boxes on [HashiCorp Cloud](https://portal.cloud.hashicorp.com). For example, [Generic Boxes](https://portal.cloud.hashicorp.com/vagrant/discover/generic) with libvirt support work seamlessly with Spinoza.
@@ -50,6 +54,7 @@ This will interactively prompt for box name, VM name, memory, CPUs, and SSH sett
 
 ```bash
 spinoza box add https://example.com/debian-11.qcow2
+spinoza box add /path/to/local/debian-11.img
 ```
 
 **3. Boot the VM**
@@ -87,15 +92,23 @@ spinoza halt
 | `spinoza halt` | Gracefully shut down the running VM |
 | `spinoza halt <name>` | Shut down a named VM |
 | `spinoza halt --force` | Force power-off the VM |
+| `spinoza reload` | Restart VM with updated config |
+| `spinoza reload <name>` | Restart a named VM |
 | `spinoza destroy` | Destroy the VM and remove its definition |
+| `spinoza destroy <name>` | Destroy a named VM |
+| `spinoza suspend` | Suspend a running VM (pause in RAM) |
+| `spinoza suspend <name>` | Suspend a named VM |
+| `spinoza resume` | Resume a suspended VM |
+| `spinoza resume <name>` | Resume a named VM |
 | `spinoza ssh` | Connect to the VM via interactive SSH |
+| `spinoza ssh <name>` | SSH into a named VM |
 | `spinoza status` | List all managed VMs and their state |
 
 ### Box Management
 
 | Command | Description |
 |---|---|
-| `spinoza box add <url>` | Download and add a qcow2 box image |
+| `spinoza box add <url-or-path>` | Download or copy a qcow2 box image |
 | `spinoza box remove <name>` | Remove a box image |
 | `spinoza box list` | List available box images |
 
@@ -104,7 +117,7 @@ spinoza halt
 ```yaml
 box: <box-name>              # Name of the qcow2 box image
 name: <vm-name>              # Unique VM identifier
-memory: <MB>                 # RAM in megabytes
+memory: <MB>                 # RAM in megabytes (min 1024)
 cpus: <count>                # Number of virtual CPUs
 network:
   subnet: <ip-prefix>        # Subnet for NAT network (e.g. 192.168.122)
@@ -118,6 +131,7 @@ Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza
 
 ## Roadmap
 
+- [ ] Auto-detection of KVM/TCG acceleration
 - [ ] Snapshot and restore support
 - [ ] Port forwarding configuration in Spinozafile
 - [ ] Provisioning scripts (shell, Ansible)
@@ -125,9 +139,6 @@ Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza
 - [ ] Custom box creation from existing VMs
 - [ ] Windows support (via WSL2 or native libvirt)
 - [ ] Plugin system for custom provisioners
-- [ ] Auto-detection of KVM/TGX acceleration
-- [ ] `spinoza reload` restart VM with updated config
-- [ ] `spinoza suspend` / `spinoza resume` save/restore VM state
 - [ ] Shared folders between host and guest
 - [ ] Private networking between VMs
 
@@ -136,11 +147,11 @@ Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza
 ```
 spinoza CLI (kapsis)
     │
-    ├── config.nim    ── Spinozafile YAML parsing (openparser)
+    ├── config.nim    ── Spinozafile YAML parsing + memory validation
     ├── paths.nim     ── Filesystem layout (flysystem)
     ├── store.nim     ── VM registry (boogie KV store)
     ├── init.nim      ── Interactive Spinozafile creation
-    ├── vm.nim        ── Domain lifecycle (libvirt)
+    ├── vm.nim        ── Domain lifecycle (libvirt), TCG wrapper
     ├── network.nim   ── NAT network management (libvirt)
     ├── ssh.nim       ── Interactive SSH sessions (libssh2)
     └── box.nim       ── Box image management (flysystem)
