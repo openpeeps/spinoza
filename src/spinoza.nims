@@ -1,0 +1,3 @@
+--passL:"-L/opt/local/lib"
+--passL:"-lssh2"
+--passC:"-I/opt/local/include"
