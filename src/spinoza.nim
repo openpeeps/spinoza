@@ -22,7 +22,9 @@ proc initSpinoza() =
 
 proc loadVmConfig(): SpinozaConfig =
   initSpinoza()
-  findAndLoadConfig()
+  let config = findAndLoadConfig()
+  validateConfig(config)
+  config
 
 proc loadVmState(name: string): VmState =
   initSpinoza()

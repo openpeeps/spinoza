@@ -9,6 +9,8 @@ import std/[os, strutils]
 import pkg/kapsis/runtime
 import pkg/kapsis/interactive/prompts
 
+import ./config
+
 const
   spinozafileTemplate = """box: $1
 name: $2
@@ -35,6 +37,19 @@ proc initCommand*(v: Values) =
   let box = prompt("Box image name", default = "debian-11")
   let name = prompt("VM name", default = "my-vm")
   let memory = prompt("Memory (MB)", default = "2048")
+
+  # Validate memory before proceeding
+  let memVal = parseInt(memory)
+  if memVal < 1024:
+    displayError("Memory must be at least 1024 MB (1 GB). Got: " & memory & " MB")
+    return
+  let hostRam = getHostRamMB()
+  if hostRam > 0 and memVal > hostRam:
+    displayError("Memory " & memory & " MB exceeds host RAM (" & $hostRam & " MB)")
+    return
+  if hostRam > 0 and memVal > int(hostRam.float * 0.70):
+    displayWarning("Memory " & memory & " MB uses more than 70% of host RAM (" & $hostRam & " MB)")
+
   let cpus = prompt("CPUs", default = "2")
   let subnet = prompt("Network subnet", default = "192.168.122")
   let sshPort = prompt("SSH port", default = "2222")
