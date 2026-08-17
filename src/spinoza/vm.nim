@@ -101,7 +101,7 @@ proc up*(config: SpinozaConfig) =
   var spinny = newSpinny("Spinning up " & config.name & "...", "dots")
   spinny.start()
 
-  let vmReady = sshModule.probeSsh(config.ssh_config.port,
+  let vmReady = sshModule.probeSsh("127.0.0.1", config.ssh_config.port,
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
@@ -194,10 +194,10 @@ proc upFromStore*(state: VmState) =
   var spinny = newSpinny("Spinning up " & state.name & "...", "dots")
   spinny.start()
 
-  let vmReady = sshModule.probeSsh(state.sshPort, state.sshUser, state.sshPass)
+  let vmReady = sshModule.probeSsh("127.0.0.1", state.sshPort, state.sshUser, state.sshPass)
 
   if vmReady:
-    spinny.success(state.name & " is ready!")
+    spinny.success(state.name & " is ready on 127.0.0.1:" & $state.sshPort)
   else:
     spinny.error("Timed out waiting for " & state.name & " to start")
 
@@ -258,7 +258,7 @@ proc reload*(config: SpinozaConfig) =
   dom.create
   updateStatus(config.name, "running")
 
-  let vmReady = sshModule.probeSsh(config.ssh_config.port,
+  let vmReady = sshModule.probeSsh("127.0.0.1", config.ssh_config.port,
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
@@ -309,7 +309,7 @@ proc reloadFromStore*(state: VmState) =
   dom.create
   updateStatus(state.name, "running")
 
-  let vmReady = sshModule.probeSsh(state.sshPort, state.sshUser, state.sshPass)
+  let vmReady = sshModule.probeSsh("127.0.0.1", state.sshPort, state.sshUser, state.sshPass)
 
   if vmReady:
     spinny.success(state.name & " reloaded and ready on 127.0.0.1:" & $state.sshPort)

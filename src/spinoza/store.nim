@@ -18,6 +18,7 @@ type
     name*: string
     memory*: int
     cpus*: int
+    sshHost*: string
     sshPort*: int
     sshUser*: string
     sshPass*: string
@@ -46,6 +47,7 @@ proc saveVm*(state: VmState) =
     "name": state.name,
     "memory": state.memory,
     "cpus": state.cpus,
+    "ssh_host": state.sshHost,
     "ssh_port": state.sshPort,
     "ssh_user": state.sshUser,
     "ssh_pass": state.sshPass,
@@ -65,7 +67,8 @@ proc loadVm*(name: string): Option[VmState] =
     name: node["name"].getStr,
     memory: node["memory"].getInt.int,
     cpus: node["cpus"].getInt.int,
-    sshPort: node["ssh_port"].getInt.int,
+    sshHost: node{"ssh_host"}.getStr(""),
+    sshPort: node{"ssh_port"}.getInt.int,
     sshUser: node["ssh_user"].getStr,
     sshPass: node["ssh_pass"].getStr,
     subnet: node["subnet"].getStr,
@@ -85,7 +88,8 @@ proc listVms*(): seq[VmState] =
         name: node["name"].getStr,
         memory: node["memory"].getInt.int,
         cpus: node["cpus"].getInt.int,
-        sshPort: node["ssh_port"].getInt.int,
+        sshHost: node{"ssh_host"}.getStr(""),
+        sshPort: node{"ssh_port"}.getInt.int,
         sshUser: node["ssh_user"].getStr,
         sshPass: node["ssh_pass"].getStr,
         subnet: node["subnet"].getStr,

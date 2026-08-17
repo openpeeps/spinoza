@@ -11,7 +11,7 @@ import libssh2
 import ./config
 import ./store
 
-proc probeSsh*(port: int, user, pass: string, timeoutSec = 120): bool =
+proc probeSsh*(host: string, port: int, user, pass: string, timeoutSec = 120): bool =
   ## Attempt an actual SSH handshake + auth to verify the VM is ready.
   ## Returns true once a full auth succeeds, false on timeout.
   discard libssh2.init(0)
@@ -21,7 +21,7 @@ proc probeSsh*(port: int, user, pass: string, timeoutSec = 120): bool =
   while now() < deadline:
     var sock = newSocket()
     try:
-      sock.connect("127.0.0.1", Port(port))
+      sock.connect(host, Port(port))
       let sockFd = sock.getFd()
 
       var session = sessionInit()
