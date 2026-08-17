@@ -15,13 +15,42 @@ import ./paths
 import ./store
 import ./ssh as sshModule
 
+const qemuTcgWrapper = """#!/bin/sh
+set -e
+QEMU_BIN="__QEMU_BIN__"
+rewrite() {
+  case "$1" in
+    *accel=hvf*)
+      printf '%s' "$1" | sed 's/accel=hvf:tcg/accel=tcg/g; s/accel=hvf/accel=tcg/g'
+      ;;
+    *)
+      printf '%s' "$1"
+      ;;
+  esac
+}
+i=1
+for arg in "$@"; do
+  set -- "$@" "$(rewrite "$arg")"
+  shift
+  i=$((i + 1))
+done
+exec "$QEMU_BIN" "$@"
+"""
+
 proc wrapperPath(): string =
   let p = getEnv("LIBVIRT_QEMUWrapper")
   if p.len > 0: p
+  elif defined(macosx):
+    let wrapper = getHomeDir() / ".spinoza" / "qemu-tcg.sh"
+    if not fileExists(wrapper):
+      let qemuBin = findExe("qemu-system-x86_64")
+      if qemuBin.len == 0:
+        raise newException(IOError, "qemu-system-x86_64 not found in PATH")
+      writeFile(wrapper, qemuTcgWrapper.replace("__QEMU_BIN__", qemuBin))
+      discard execShellCmd("chmod +x " & wrapper)
+    wrapper
   else:
-    let localPath = getCurrentDir() / "qemu-tcg.sh"
-    if fileExists(localPath): localPath
-    else: findExe("qemu-system-x86_64")
+    findExe("qemu-system-x86_64")
 
 proc resolveBoxPath*(config: SpinozaConfig): string =
   let disk = fs.rawDisk("boxes")

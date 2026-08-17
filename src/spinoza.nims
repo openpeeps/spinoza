@@ -1,5 +1,3 @@
---path:"/Users/georgelemon/Development/bindings/libvirt/src"
---path:"/Users/georgelemon/Development/toys/boogie/src"
 --passL:"-L/opt/local/lib"
 --passL:"-lvirt-qemu"
 --passL:"-lssh2"

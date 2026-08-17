@@ -11,20 +11,33 @@ import flysystem
 
 import ./paths
 
-proc addBox*(url: string) =
-  let name = url.extractFilename().splitFile().name
+proc isLocalPath*(input: string): bool =
+  input.startsWith("/") or input.startsWith("./") or
+  input.startsWith("../") or input.startsWith("~/")
+
+proc addBox*(source: string) =
+  let name = source.extractFilename().splitFile().name
   let dest = boxPath(name)
   let disk = fs.disk("boxes")
   if disk.exists(dest):
     displayWarning("Box already exists: " & name)
     return
-  displayInfo("Downloading " & name & "...")
-  let client = newHttpClient()
-  let tmpFile = getTempDir() / (name & ".img")
-  client.downloadFile(url, tmpFile)
-  let content = readFile(tmpFile)
+  let content =
+    if isLocalPath(source):
+      let resolved = source.expandTilde().expandFilename()
+      if not fileExists(resolved):
+        displayError("File not found: " & resolved, quitProcess = true)
+        return
+      readFile(resolved)
+    else:
+      displayInfo("Downloading " & name & "...")
+      let client = newHttpClient()
+      let tmpFile = getTempDir() / (name & ".img")
+      client.downloadFile(source, tmpFile)
+      let data = readFile(tmpFile)
+      removeFile(tmpFile)
+      data
   disk.write(dest, content)
-  removeFile(tmpFile)
   displaySuccess("Added box: " & name)
 
 proc removeBox*(name: string) =
