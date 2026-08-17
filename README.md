@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://github.com/openpeeps/spinoza/blob/main/.github/spinoza-logo.png" width="120px"><br>
   Spinoza – Spin up Virtual Machines like a PRO<br>
-  A super lightweight alternative to Vagrant, VMWare or VirtualBox
+  A super lightweight alternative to Vagrant, VMware or VirtualBox
 </p>
 
 <p align="center">
