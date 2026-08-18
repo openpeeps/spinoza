@@ -30,6 +30,7 @@ Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to li
 - **VM registry** named VMs stored in a local boogie KV store
 - **Full VM lifecycle** boot, halt, reload, destroy, suspend, and resume
 - **Box management** download, list, and remove qcow2 box images (local files and URLs)
+- **Shared folders** mount host directories inside the VM via virtiofs
 - **Memory validation** enforces minimum 1 GB, checks against host RAM, warns at 70% usage
 - **QEMU TCG fallback** auto-generated wrapper on macOS when hardware acceleration is unavailable
 - **Flysystem-backed storage** atomic file operations for boxes and VM state
@@ -48,7 +49,7 @@ You will need to install `libvirt`, `QEMU`, and `libssh2`.
 spinoza init
 ```
 
-This will interactively prompt for box name, VM name, memory, CPUs, and SSH settings.
+This will interactively prompt for box name, VM name, memory, CPUs, SSH settings, and optional shared folders.
 
 **2. Add a box image**
 
@@ -69,65 +70,107 @@ spinoza up
 spinoza ssh
 ```
 
-**5. Shut down**
+**5. Mount shared folders (inside guest)**
+
+```bash
+# If shared_folders are configured in Spinozafile:
+sudo mount -t virtiofs <tag> /mnt/shared
+```
+
+**6. Shut down**
 
 ```bash
 spinoza halt
 ```
 
-## Commands
-
-### Setup
-
-| Command | Description |
-|---|---|
-| `spinoza init` | Create a Spinozafile in the current directory |
-
-### Virtual Machines
-
-| Command | Description |
-|---|---|
-| `spinoza up` | Boot a VM from the Spinozafile |
-| `spinoza up <name>` | Boot a named VM from the registry |
-| `spinoza halt` | Gracefully shut down the running VM |
-| `spinoza halt <name>` | Shut down a named VM |
-| `spinoza halt --force` | Force power-off the VM |
-| `spinoza reload` | Restart VM with updated config |
-| `spinoza reload <name>` | Restart a named VM |
-| `spinoza destroy` | Destroy the VM and remove its definition |
-| `spinoza destroy <name>` | Destroy a named VM |
-| `spinoza suspend` | Suspend a running VM (pause in RAM) |
-| `spinoza suspend <name>` | Suspend a named VM |
-| `spinoza resume` | Resume a suspended VM |
-| `spinoza resume <name>` | Resume a named VM |
-| `spinoza ssh` | Connect to the VM via interactive SSH |
-| `spinoza ssh <name>` | SSH into a named VM |
-| `spinoza status` | List all managed VMs and their state |
-
-### Box Management
-
-| Command | Description |
-|---|---|
-| `spinoza box add <url-or-path>` | Download or copy a qcow2 box image |
-| `spinoza box remove <name>` | Remove a box image |
-| `spinoza box list` | List available box images |
-
 ## Spinozafile Format
 
 ```yaml
-box: <box-name>              # Name of the qcow2 box image
-name: <vm-name>              # Unique VM identifier
-memory: <MB>                 # RAM in megabytes (min 1024)
-cpus: <count>                # Number of virtual CPUs
+box: debian-11                # Name of the qcow2 box image
+name: spinoza-debian          # Unique VM identifier
+memory: 2048                  # RAM in megabytes (min 1024)
+cpus: 2                       # Number of virtual CPUs
 network:
-  subnet: <ip-prefix>        # Subnet for NAT network (e.g. 192.168.122)
+  subnet: 192.168.122         # Subnet for NAT network
 ssh_config:
-  port: <port>               # Host port forwarded to guest SSH
-  user: <username>           # SSH username
-  password: <password>       # SSH password
+  port: 2222                  # Host port forwarded to guest SSH
+  user: vagrant               # SSH username
+  password: vagrant           # SSH password
+shared_folders:               # Optional: mount host dirs via virtiofs
+  - host: /Users/<username>/code    # Host directory path
+    tag: code                       # Mount tag used in guest
+  - host: /Users/<username>/data
+    tag: data
 ```
 
 Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza/vms/`.
+
+## libvirt XML API
+
+Spinoza uses a typed object model for building libvirt domain XML. Instead of DSL macros, you work with plain Nim objects and call `toXML()` to render:
+
+```nim
+import libvirt
+
+var domain = LibvirtDomain(
+  virtType: "qemu",
+  metadata: LibvirtMetadata(name: "my-vm"),
+  memory: LibvirtMemory(value: "2048", unit: "MiB"),
+  currentMemory: LibvirtMemory(value: "2048", unit: "MiB"),
+  vcpu: LibvirtVcpu(value: "2", placement: "static"),
+  os: LibvirtOS(
+    osType: "hvm",
+    arch: "x86_64",
+    machine: "pc",
+    boot: @[bdHardDisk]
+  ),
+  clock: LibvirtClock(offset: "utc"),
+  events: LibvirtEvents(
+    onPoweroff: oaDestroy,
+    onReboot: oaRestart,
+    onCrash: oaDestroy
+  ),
+  emulator: "/usr/bin/qemu-system-x86_64",
+  disks: @[LibvirtDisk(
+    diskType: "file",
+    device: "disk",
+    driverName: "qemu",
+    driverType: "qcow2",
+    sourceFile: "/path/to/box.img",
+    targetDev: "sda",
+    targetBus: "virtio"
+  )],
+  serials: @[LibvirtSerial(sourceType: "pty", targetPort: "0")],
+  consoles: @[LibvirtConsole(
+    sourceType: "pty",
+    targetType: "serial",
+    targetPort: "0"
+  )],
+  qemuArgs: @[
+    "-netdev", "user,id=hostnet0,hostfwd=tcp::2222-:22",
+    "-device", "virtio-net-pci,netdev=hostnet0"
+  ]
+)
+
+echo toXML(domain)
+```
+
+With shared folders (virtiofs):
+
+```nim
+domain.memoryBacking = LibvirtMemoryBacking(
+  sourceType: "memfd",
+  accessMode: "shared"
+)
+domain.filesystems.add LibvirtFilesystem(
+  fsType: "mount",
+  accessmode: "passthrough",
+  driverType: "virtiofs",
+  driverQueue: "1024",
+  sourceDir: "/Users/george/code",
+  targetDir: "code"
+)
+```
 
 ## Roadmap
 
@@ -139,7 +182,6 @@ Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza
 - [ ] Custom box creation from existing VMs
 - [ ] Windows support (via WSL2 or native libvirt)
 - [ ] Plugin system for custom provisioners
-- [ ] Shared folders between host and guest
 - [ ] Private networking between VMs
 
 ## Architecture

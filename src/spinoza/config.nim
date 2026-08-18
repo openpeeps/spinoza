@@ -22,6 +22,10 @@ type
   NetworkConfig* = object
     subnet*: string
 
+  SharedFolder* = object
+    host*: string
+    tag*: string
+
   SpinozaConfig* = object
     box*: string
     name*: string
@@ -29,6 +33,7 @@ type
     cpus*: int
     network*: NetworkConfig
     ssh_config*: SshConfig
+    shared_folders*: seq[SharedFolder]
 
 proc getHostRamMB*(): int =
   ## Get total host physical RAM in MB.

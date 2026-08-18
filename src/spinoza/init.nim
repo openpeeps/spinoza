@@ -22,7 +22,7 @@ ssh_config:
   port: $6
   user: $7
   password: $8
-"""
+$9"""
 
 proc initCommand*(v: Values) =
   ## Create a Spinozafile in the current directory
@@ -56,9 +56,28 @@ proc initCommand*(v: Values) =
   let sshUser = prompt("SSH user", default = "vagrant")
   let sshPass = promptSecret("SSH password")
 
+  # Shared folders (optional, loop until empty)
+  echo ""
+  var sharedFoldersBlock = ""
+  var sharedFolders: seq[SharedFolder]
+  while true:
+    let hostPath = prompt("Shared folder path (empty to skip)")
+    if hostPath.len == 0: break
+    let mountTag = prompt("Mount tag in guest")
+    if mountTag.len == 0:
+      displayWarning("Skipping shared folder with empty tag")
+      continue
+    sharedFolders.add SharedFolder(host: hostPath, tag: mountTag)
+    sharedFoldersBlock.add "  - host: " & hostPath & "\n    tag: " & mountTag & "\n"
+
+  var sharedSection = ""
+  if sharedFolders.len > 0:
+    sharedSection = "shared_folders:\n" & sharedFoldersBlock
+
   let content = spinozafileTemplate % [
     box, name, memory, cpus, subnet, sshPort, sshUser,
-    if sshPass.len > 0: sshPass else: "vagrant"
+    if sshPass.len > 0: sshPass else: "vagrant",
+    sharedSection
   ]
 
   writeFile(configFile, content)

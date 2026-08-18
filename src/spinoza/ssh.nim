@@ -40,6 +40,50 @@ proc probeSsh*(host: string, port: int, user, pass: string, timeoutSec = 120): b
     sleep(3000)
   false
 
+proc sshExec*(host: string, port: int, user, pass, cmd: string): string =
+  ## Execute a command via SSH and return stdout. Non-interactive.
+  discard libssh2.init(0)
+  defer: libssh2.exit()
+
+  var sock = newSocket()
+  defer: sock.close()
+  sock.connect(host, Port(port))
+  let sockFd = sock.getFd()
+
+  var session = sessionInit()
+  if session.sessionHandshake(sockFd) != 0:
+    raise newException(IOError, "SSH handshake failed")
+  defer:
+    discard session.sessionDisconnect("bye")
+    discard session.sessionFree()
+
+  if session.userauthPassword(user, pass, nil) != 0:
+    raise newException(IOError, "SSH authentication failed for " & user)
+
+  var channel = session.channelOpenSession()
+  if channel.isNil:
+    raise newException(IOError, "Failed to open SSH channel")
+  defer: discard channel.channelFree()
+
+  if channel.channelExec(cmd) != 0:
+    raise newException(IOError, "Failed to exec command: " & cmd)
+
+  var buf: array[4096, char]
+  var output = ""
+  while true:
+    let rc = channel.channelRead(addr buf[0], 4096)
+    if rc > 0:
+      output.add(cast[cstring](addr buf[0]))
+    elif rc == 0:
+      break
+    else:
+      let err = session.sessionLastErrno()
+      if err != LIBSSH2_ERROR_EAGAIN:
+        break
+
+  discard channel.channelSendEof()
+  output
+
 proc getTerminalSize(): (int, int) =
   result = (terminalWidth(), terminalHeight())
 

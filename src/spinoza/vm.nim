@@ -59,37 +59,56 @@ proc resolveBoxPath*(config: SpinozaConfig): string =
 proc domainXml*(config: SpinozaConfig, boxPath: string): string =
   let mem = $(config.memory * 1024)
   let sshPort = $config.ssh_config.port
-  let d = domain(`type`="qemu"):
-    name: config.name
-    memory unit="KiB": mem
-    currentMemory unit="KiB": mem
-    vcpu placement="static": $config.cpus
-    os:
-      `type` arch="x86_64", machine="pc": "hvm"
-      boot dev="hd"
-    clock offset="utc"
-    on_poweroff: "destroy"
-    on_reboot: "restart"
-    on_crash: "destroy"
-    devices:
-      emulator: wrapperPath()
-      disk `type`="file", device="disk":
-        driver name="qemu", `type`="qcow2"
-        source file=boxPath
-        target dev="sda", bus="scsi"
-      serial `type`="pty":
-        target port="0"
-      console `type`="pty":
-        target `type`="serial", port="0"
-      channel `type`="unix":
-        source mode="bind"
-        target `type`="virtio", name="org.qemu.guest_agent.0"
-    qemu_commandline:
-      qemu_arg value="-netdev"
-      qemu_arg value="user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22"
-      qemu_arg value="-device"
-      qemu_arg value="virtio-net-pci,netdev=hostnet0,addr=0x7"
-  $d
+  var d = LibvirtDomain(
+    virtType: "qemu",
+    metadata: LibvirtMetadata(name: config.name),
+    memory: LibvirtMemory(value: mem, unit: "KiB"),
+    currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
+    vcpu: LibvirtVcpu(value: $config.cpus, placement: "static"),
+    os: LibvirtOS(
+      osType: "hvm", arch: "x86_64", machine: "pc",
+      boot: @[bdHardDisk]
+    ),
+    clock: LibvirtClock(offset: "utc"),
+    events: LibvirtEvents(
+      onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
+    emulator: wrapperPath(),
+    disks: @[LibvirtDisk(
+      diskType: "file", device: "disk",
+      driverName: "qemu", driverType: "qcow2",
+      sourceFile: boxPath,
+      targetDev: "vda", targetBus: "virtio"
+    )],
+    serials: @[LibvirtSerial(sourceType: "pty", targetPort: "0")],
+    consoles: @[LibvirtConsole(
+      sourceType: "pty", targetType: "serial", targetPort: "0"
+    )],
+    channels: @[LibvirtChannel(
+      channelType: "unix", sourceMode: "bind",
+      targetType: "virtio", targetName: "org.qemu.guest_agent.0"
+    )],
+    qemuArgs: @[
+      "-netdev", "user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22",
+      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"
+    ]
+  )
+  when defined(macosx):
+    if config.shared_folders.len > 0:
+      for i, f in config.shared_folders:
+        let fsId = "fsdev" & $i
+        d.qemuArgs.add "-fsdev"
+        d.qemuArgs.add "local,path=" & f.host & ",id=" & fsId & ",security_model=none"
+        d.qemuArgs.add "-device"
+        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag & ",addr=0x8"
+  else:
+    if config.shared_folders.len > 0:
+      d.memoryBacking = LibvirtMemoryBacking(sourceType: "memfd", accessMode: "shared")
+      for f in config.shared_folders:
+        d.filesystems.add LibvirtFilesystem(
+          fsType: "mount", accessmode: "passthrough",
+          driverType: "virtiofs", driverQueue: "1024",
+          sourceDir: f.host, targetDir: f.tag)
+  toXML(d)
 
 proc cleanup*(conn: Connect, domainName: string) =
   try:
@@ -123,6 +142,7 @@ proc up*(config: SpinozaConfig) =
     sshUser: config.ssh_config.user,
     sshPass: config.ssh_config.password,
     subnet: config.network.subnet,
+    sharedFolders: config.shared_folders,
     status: "running"
   )
   saveVm(state)
@@ -134,6 +154,18 @@ proc up*(config: SpinozaConfig) =
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
+    if config.shared_folders.len > 0:
+      for f in config.shared_folders:
+        let mkdirCmd = "sudo mkdir -p /mnt/" & f.tag
+        let mountCmd =
+          when defined(macosx):
+            "sudo mount -t 9p -o trans=virtio " & f.tag & " /mnt/" & f.tag
+          else:
+            "sudo mount -t virtiofs " & f.tag & " /mnt/" & f.tag
+        discard sshModule.sshExec("127.0.0.1", config.ssh_config.port,
+          config.ssh_config.user, config.ssh_config.password, mkdirCmd)
+        discard sshModule.sshExec("127.0.0.1", config.ssh_config.port,
+          config.ssh_config.user, config.ssh_config.password, mountCmd)
     spinny.success(config.name & " is ready on 127.0.0.1:" & $config.ssh_config.port)
   else:
     spinny.error("Timed out waiting for " & config.name & " to start")
@@ -171,37 +203,56 @@ proc status*(config: SpinozaConfig) =
 proc domainXmlFromState*(state: VmState, boxPath: string): string =
   let mem = $(state.memory * 1024)
   let sshPort = $state.sshPort
-  let d = domain(`type`="qemu"):
-    name: state.name
-    memory unit="KiB": mem
-    currentMemory unit="KiB": mem
-    vcpu placement="static": $state.cpus
-    os:
-      `type` arch="x86_64", machine="pc": "hvm"
-      boot dev="hd"
-    clock offset="utc"
-    on_poweroff: "destroy"
-    on_reboot: "restart"
-    on_crash: "destroy"
-    devices:
-      emulator: wrapperPath()
-      disk `type`="file", device="disk":
-        driver name="qemu", `type`="qcow2"
-        source file=boxPath
-        target dev="sda", bus="scsi"
-      serial `type`="pty":
-        target port="0"
-      console `type`="pty":
-        target `type`="serial", port="0"
-      channel `type`="unix":
-        source mode="bind"
-        target `type`="virtio", name="org.qemu.guest_agent.0"
-    qemu_commandline:
-      qemu_arg value="-netdev"
-      qemu_arg value="user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22"
-      qemu_arg value="-device"
-      qemu_arg value="virtio-net-pci,netdev=hostnet0,addr=0x7"
-  $d
+  var d = LibvirtDomain(
+    virtType: "qemu",
+    metadata: LibvirtMetadata(name: state.name),
+    memory: LibvirtMemory(value: mem, unit: "KiB"),
+    currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
+    vcpu: LibvirtVcpu(value: $state.cpus, placement: "static"),
+    os: LibvirtOS(
+      osType: "hvm", arch: "x86_64", machine: "pc",
+      boot: @[bdHardDisk]
+    ),
+    clock: LibvirtClock(offset: "utc"),
+    events: LibvirtEvents(
+      onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
+    emulator: wrapperPath(),
+    disks: @[LibvirtDisk(
+      diskType: "file", device: "disk",
+      driverName: "qemu", driverType: "qcow2",
+      sourceFile: boxPath,
+      targetDev: "vda", targetBus: "virtio"
+    )],
+    serials: @[LibvirtSerial(sourceType: "pty", targetPort: "0")],
+    consoles: @[LibvirtConsole(
+      sourceType: "pty", targetType: "serial", targetPort: "0"
+    )],
+    channels: @[LibvirtChannel(
+      channelType: "unix", sourceMode: "bind",
+      targetType: "virtio", targetName: "org.qemu.guest_agent.0"
+    )],
+    qemuArgs: @[
+      "-netdev", "user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22",
+      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"
+    ]
+  )
+  when defined(macosx):
+    if state.sharedFolders.len > 0:
+      for i, f in state.sharedFolders:
+        let fsId = "fsdev" & $i
+        d.qemuArgs.add "-fsdev"
+        d.qemuArgs.add "local,path=" & f.host & ",id=" & fsId & ",security_model=none"
+        d.qemuArgs.add "-device"
+        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag & ",addr=0x8"
+  else:
+    if state.sharedFolders.len > 0:
+      d.memoryBacking = LibvirtMemoryBacking(sourceType: "memfd", accessMode: "shared")
+      for f in state.sharedFolders:
+        d.filesystems.add LibvirtFilesystem(
+          fsType: "mount", accessmode: "passthrough",
+          driverType: "virtiofs", driverQueue: "1024",
+          sourceDir: f.host, targetDir: f.tag)
+  toXML(d)
 
 proc resolveBoxPathFromState*(state: VmState): string =
   let disk = fs.rawDisk("boxes")
@@ -226,6 +277,18 @@ proc upFromStore*(state: VmState) =
   let vmReady = sshModule.probeSsh("127.0.0.1", state.sshPort, state.sshUser, state.sshPass)
 
   if vmReady:
+    if state.sharedFolders.len > 0:
+      for f in state.sharedFolders:
+        let mkdirCmd = "sudo mkdir -p /mnt/" & f.tag
+        let mountCmd =
+          when defined(macosx):
+            "sudo mount -t 9p -o trans=virtio " & f.tag & " /mnt/" & f.tag
+          else:
+            "sudo mount -t virtiofs " & f.tag & " /mnt/" & f.tag
+        discard sshModule.sshExec("127.0.0.1", state.sshPort,
+          state.sshUser, state.sshPass, mkdirCmd)
+        discard sshModule.sshExec("127.0.0.1", state.sshPort,
+          state.sshUser, state.sshPass, mountCmd)
     spinny.success(state.name & " is ready on 127.0.0.1:" & $state.sshPort)
   else:
     spinny.error("Timed out waiting for " & state.name & " to start")

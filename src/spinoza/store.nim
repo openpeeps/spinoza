@@ -10,6 +10,7 @@ import boogie/stores/kv
 import pkg/openparser/uuid
 
 import ./paths
+import ./config
 
 type
   VmState* = object
@@ -23,6 +24,7 @@ type
     sshUser*: string
     sshPass*: string
     subnet*: string
+    sharedFolders*: seq[SharedFolder]
     status*: string
 
 var store*: KvStore
@@ -41,6 +43,14 @@ proc newVmUuid*(): string =
   $v4()
 
 proc saveVm*(state: VmState) =
+  var folders: JsonNode
+  if state.sharedFolders.len > 0:
+    var arr = newJArray()
+    for f in state.sharedFolders:
+      arr.add(%*{"host": f.host, "tag": f.tag})
+    folders = arr
+  else:
+    folders = newJArray()
   let data = $(%*{
     "uuid": state.uuid,
     "box": state.box,
@@ -52,6 +62,7 @@ proc saveVm*(state: VmState) =
     "ssh_user": state.sshUser,
     "ssh_pass": state.sshPass,
     "subnet": state.subnet,
+    "shared_folders": folders,
     "status": state.status
   })
   store.put(vmKey(state.name), data)
@@ -61,6 +72,12 @@ proc loadVm*(name: string): Option[VmState] =
   if raw.isNone:
     return none(VmState)
   let node = parseJson(raw.get())
+  var folders: seq[SharedFolder]
+  if node.hasKey("shared_folders"):
+    for f in node["shared_folders"]:
+      folders.add SharedFolder(
+        host: f["host"].getStr,
+        tag: f["tag"].getStr)
   some(VmState(
     uuid: node["uuid"].getStr,
     box: node["box"].getStr,
@@ -72,6 +89,7 @@ proc loadVm*(name: string): Option[VmState] =
     sshUser: node["ssh_user"].getStr,
     sshPass: node["ssh_pass"].getStr,
     subnet: node["subnet"].getStr,
+    sharedFolders: folders,
     status: node["status"].getStr
   ))
 
@@ -82,6 +100,12 @@ proc listVms*(): seq[VmState] =
   for k, v in store.pairsUnordered:
     if k.startsWith("vm:"):
       let node = parseJson(v)
+      var folders: seq[SharedFolder]
+      if node.hasKey("shared_folders"):
+        for f in node["shared_folders"]:
+          folders.add SharedFolder(
+            host: f["host"].getStr,
+            tag: f["tag"].getStr)
       result.add VmState(
         uuid: node["uuid"].getStr,
         box: node["box"].getStr,
@@ -93,6 +117,7 @@ proc listVms*(): seq[VmState] =
         sshUser: node["ssh_user"].getStr,
         sshPass: node["ssh_pass"].getStr,
         subnet: node["subnet"].getStr,
+        sharedFolders: folders,
         status: node["status"].getStr
       )
 
