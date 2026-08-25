@@ -17,6 +17,7 @@ import ./spinoza/ssh as sshModule
 import ./spinoza/box as boxModule
 import ./spinoza/init as initModule
 import ./spinoza/logs as logsModule
+import ./spinoza/provision as provisionModule
 
 proc initSpinoza() =
   initFs()
@@ -43,12 +44,15 @@ proc upCommand*(v: Values) =
   let vmName =
     if v.has("vmName"): v.get("vmName").getStr
     else: ""
+  let provision = v.has("--provision")
   if vmName.len > 0:
+    if provision:
+      displayWarning("--provision with a named VM requires a Spinozafile in the current directory; skipping")
     let state = loadVmState(vmName)
     vmModule.upFromStore(state)
   else:
     let config = loadVmConfig()
-    vmModule.up(config)
+    vmModule.up(config, provision)
 
 proc haltCommand*(v: Values) =
   initSpinoza()
@@ -130,12 +134,30 @@ proc reloadCommand*(v: Values) =
   let vmName =
     if v.has("vmName"): v.get("vmName").getStr
     else: ""
+  let provision = v.has("--provision")
   if vmName.len > 0:
+    if provision:
+      displayWarning("--provision with a named VM requires a Spinozafile in the current directory; skipping")
     let state = loadVmState(vmName)
     vmModule.reloadFromStore(state)
   else:
     let config = loadVmConfig()
-    vmModule.reload(config)
+    vmModule.reload(config, provision)
+
+proc provisionCommand*(v: Values) =
+  initSpinoza()
+  var state: VmState
+  if v.has("vmName"):
+    state = loadVmState(v.get("vmName").getStr)
+  elif fileExists(findConfig()):
+    state = loadVmState(findAndLoadConfig().name)
+  else:
+    raise newException(IOError, "No VM specified and no Spinozafile found")
+  if state.status != "running":
+    raise newException(IOError, state.name & " is not running (" & state.status & ")")
+  # Provisioners always come from the Spinozafile next to the project
+  let config = findAndLoadConfig()
+  provisionModule.provisionRunning(state, config)
 
 proc suspendCommand*(v: Values) =
   initSpinoza()
@@ -171,12 +193,14 @@ when isMainModule:
         ## Create a Spinozafile in the current directory
 
       -- "Virtual Machines"
-      up ?string(vmName):
+      up ?string(vmName), ?bool("--provision"):
         ## Boot a VM from the Spinozafile (or named VM from registry)
       halt ?string(vmName), ?bool("--force"):
         ## Gracefully shut down the running VM
-      reload ?string(vmName):
+      reload ?string(vmName), ?bool("--provision"):
         ## Reload VM config and restart
+      provision ?string(vmName):
+        ## Run provisioners against a running VM
       destroy ?string(vmName):
         ## Destroy the VM and remove its definition
       suspend ?string(vmName):

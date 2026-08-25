@@ -21,7 +21,13 @@ network:
 ssh_config:
   user: $6
   password: $7
-$8"""
+$8# Provisioners run with 'spinoza up --provision', 'spinoza reload --provision',
+# or 'spinoza provision' on a running VM:
+# provision:
+#   - sudo apt-get update
+#   - sudo apt-get install -y nginx
+# provision_script:
+#   - ./scripts/bootstrap.sh"""
 
 proc initCommand*(v: Values) =
   ## Create a Spinozafile in the current directory

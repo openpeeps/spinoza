@@ -5,7 +5,7 @@
 #          Made by Humans from OpenPeeps
 #          https://github.com/openpeeps/spinoza
 
-import std/[net, options, os, posix, termios, times, terminal]
+import std/[net, options, os, posix, strutils, termios, times, terminal]
 import libssh2
 
 import ./config
@@ -124,6 +124,82 @@ proc sshExec*(host: string, port: int, user, pass, cmd: string): string =
 
   discard channel.channelSendEof()
   output
+
+proc sshExecStream*(host: string, port: int, user, pass, cmd: string,
+                    stdinPayload = "",
+                    onLine: proc(line: string) {.closure.} = nil):
+    tuple[output: string, code: int] =
+  ## Execute `cmd` over SSH, optionally feeding `stdinPayload` to its stdin,
+  ## streaming complete stdout/stderr lines through `onLine` as they arrive.
+  ## Returns the full output and the remote exit status.
+  discard libssh2.init(0)
+  defer: libssh2.exit()
+
+  var sock = newSocket()
+  defer: sock.close()
+  sock.connect(host, Port(port))
+  let sockFd = sock.getFd()
+
+  var session = sessionInit()
+  if session.sessionHandshake(sockFd) != 0:
+    raise newException(IOError, "SSH handshake failed")
+  defer:
+    discard session.sessionDisconnect("bye")
+    discard session.sessionFree()
+
+  if session.userauthPassword(user, pass, nil) != 0:
+    raise newException(IOError, "SSH authentication failed for " & user)
+
+  var channel = session.channelOpenSession()
+  if channel.isNil:
+    raise newException(IOError, "Failed to open SSH channel")
+  defer: discard channel.channelFree()
+
+  # Merge stderr into the stdout stream so all output is streamed
+  discard channel.channelHandleExtendedData2(
+    LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE)
+
+  if channel.channelExec(cmd) != 0:
+    raise newException(IOError, "Failed to exec command: " & cmd)
+
+  if stdinPayload.len > 0:
+    var written = 0
+    while written < stdinPayload.len:
+      let n = channel.channelWrite(
+        cast[cstring](unsafeAddr stdinPayload[written]),
+        cint(stdinPayload.len - written))
+      if n <= 0:
+        raise newException(IOError, "Failed to write stdin payload")
+      inc(written, int(n))
+  discard channel.channelSendEof()
+
+  var buf: array[4096, char]
+  var partial = ""
+  while true:
+    let rc = channel.channelRead(addr buf[0], 4096)
+    if rc > 0:
+      var chunk = newString(int(rc))
+      copyMem(addr chunk[0], addr buf[0], int(rc))
+      result.output.add(chunk)
+      partial.add(chunk)
+      var idx = partial.find('\n')
+      while idx >= 0:
+        let line = partial[0 ..< idx]
+        partial = partial[(idx + 1)..^1]
+        if onLine != nil and line.strip().len > 0:
+          onLine(line)
+        idx = partial.find('\n')
+    elif rc == 0:
+      break
+    else:
+      let err = session.sessionLastErrno()
+      if err != LIBSSH2_ERROR_EAGAIN:
+        break
+
+  if onLine != nil and partial.strip().len > 0:
+    onLine(partial)
+
+  result.code = int(channel.channelGetExitStatus())
 
 proc getTerminalSize(): (int, int) =
   result = (terminalWidth(), terminalHeight())

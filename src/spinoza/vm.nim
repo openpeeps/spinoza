@@ -14,6 +14,7 @@ import ./config
 import ./logs
 import ./network
 import ./paths
+import ./provision as provisionModule
 import ./store
 import ./ssh as sshModule
 
@@ -275,7 +276,7 @@ proc discoverEndpoint(spinny: var Spinny, mode, name,
     return (state.get().sshHost, state.get().sshPort)
   return ("127.0.0.1", 22)
 
-proc up*(config: SpinozaConfig) =
+proc up*(config: SpinozaConfig, provision = false) =
   let conn = openConnect("qemu:///session")
   defer: conn.close
 
@@ -329,6 +330,12 @@ proc up*(config: SpinozaConfig) =
   if vmReady:
     autoMountSharedFolders(host, port,
       config.ssh_config.user, config.ssh_config.password, config.shared_folders)
+    if provision:
+      let ok = provisionModule.runProvisions(addr spinny, host, port,
+        config.ssh_config.user, config.ssh_config.password,
+        config.provision, config.provision_script)
+      if not ok: return
+      spinny.setText("Provisioning complete")
     spinny.success(config.name & " is ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & config.name & " to start")
@@ -468,7 +475,7 @@ proc haltFromStore*(state: VmState, force: bool = false) =
   except LibvirtError:
     discard
 
-proc reload*(config: SpinozaConfig) =
+proc reload*(config: SpinozaConfig, provision = false) =
   let conn = openConnect("qemu:///session")
   defer: conn.close
 
@@ -550,6 +557,11 @@ proc reload*(config: SpinozaConfig) =
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
+    if provision:
+      let ok = provisionModule.runProvisions(addr spinny, host, port,
+        config.ssh_config.user, config.ssh_config.password,
+        config.provision, config.provision_script)
+      if not ok: return
     spinny.success(config.name & " reloaded and ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & config.name & " to restart")

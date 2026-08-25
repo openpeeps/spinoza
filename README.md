@@ -104,9 +104,26 @@ shared_folders:               # Optional: mount host dirs
     tag: code                       # Mount tag used in guest
   - host: /Users/<username>/data
     tag: data
+provision:                    # Optional: shell commands run over SSH, in order
+  - sudo apt-get update
+  - sudo apt-get install -y nginx
+provision_script:             # Optional: local scripts piped to remote `bash -s`
+  - ./scripts/bootstrap.sh    # Paths resolve relative to the Spinozafile
 ```
 
 Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza/vms/`. Console logs are written to `~/.spinoza/logs/<name>.log`.
+
+## Provisioning
+
+Provisioners run inside the guest over SSH. All `provision:` commands execute first (in order), then every `provision_script:` file is piped to `bash -s` on the guest.
+
+```bash
+spinoza up --provision        # boot, then provision
+spinoza reload --provision    # restart with the current Spinozafile, then provision
+spinoza provision             # re-run provisioners on an already-running VM
+```
+
+Output streams live as each step runs. Provisioning stops at the first failing command and reports its exit code; the VM itself stays up. Running without a configured `provision:` section is a no-op.
 
 ## Networking
 

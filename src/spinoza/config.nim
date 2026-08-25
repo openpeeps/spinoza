@@ -13,6 +13,43 @@ import ./paths
 
 export paths
 
+proc parseHook*(p: var YamlParser, v: var seq[string]) =
+  ## Override openparser's generic sequence parser for string items.
+  ## The stock implementation consumes exactly one token per item, so
+  ## multi-word plain scalars (`- echo hello world`) break parsing.
+  ## Rebuild each block-sequence item from every token on its line.
+  v.setLen(0)
+  case p.curr.kind
+  of ytkLB:
+    # Inline sequence: [a, b, c]
+    p.advance() # '['
+    while p.curr.kind != ytkRB:
+      if p.curr.kind == ytkEOF:
+        p.error("Unexpected end of file in inline sequence")
+      var item: string
+      p.parseHook(item)
+      v.add(item)
+      if p.curr.kind == ytkComma:
+        p.advance()
+      elif p.curr.kind != ytkRB:
+        p.error("Expected comma or ] in inline sequence")
+    p.advance() # ']'
+  of ytkDash:
+    # Block sequence:
+    # - item one
+    # - item two
+    let seqIndent = p.curr.indent
+    while p.curr.kind == ytkDash and p.curr.indent == seqIndent:
+      let dashLine = p.curr.line
+      p.advance() # '-'
+      var parts: seq[string] = @[]
+      while p.curr.kind != ytkEOF and p.curr.line == dashLine:
+        parts.add(p.curr.value)
+        p.advance()
+      v.add(parts.join(" "))
+  else:
+    p.error("Expected a sequence")
+
 type
   SshConfig* = object
     user*: string
@@ -34,6 +71,8 @@ type
     network*: NetworkConfig
     ssh_config*: SshConfig
     shared_folders*: seq[SharedFolder]
+    provision*: seq[string]         ## Inline shell commands, run in order over SSH
+    provision_script*: seq[string]  ## Local script paths, piped to remote `bash -s`
 
 proc getHostRamMB*(): int =
   ## Get total host physical RAM in MB.
@@ -91,8 +130,18 @@ proc validateConfig*(config: SpinozaConfig) =
       "Invalid network.mode '" & mode &
       "' (expected: user, shared, or host)")
 
+  for script in config.provision_script:
+    if not fileExists(script):
+      raise newException(IOError, "Provision script not found: " & script)
+
 proc loadConfig*(path: string): SpinozaConfig =
-  parseYAML(readFile(path), SpinozaConfig)
+  var config = parseYAML(readFile(path), SpinozaConfig)
+  # Resolve provision script paths relative to the Spinozafile directory
+  let baseDir = parentDir(absolutePath(path))
+  for i, s in mpairs(config.provision_script):
+    if not isAbsolute(s):
+      config.provision_script[i] = joinPath(baseDir, s)
+  config
 
 proc findAndLoadConfig*(dir: string = getCurrentDir()): SpinozaConfig =
   let path = findConfig(dir)
