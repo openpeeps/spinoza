@@ -6,7 +6,8 @@
 #          https://github.com/openpeeps/spinoza
 
 import pkg/kapsis/runtime
-import std/options
+import pkg/kapsis/interactive/prompts
+import std/[options, os]
 
 import ./spinoza/config
 import ./spinoza/paths
@@ -15,6 +16,7 @@ import ./spinoza/vm as vmModule
 import ./spinoza/ssh as sshModule
 import ./spinoza/box as boxModule
 import ./spinoza/init as initModule
+import ./spinoza/logs as logsModule
 
 proc initSpinoza() =
   initFs()
@@ -85,6 +87,20 @@ proc sshCommand*(v: Values) =
   else:
     let config = loadVmConfig()
     sshModule.ssh(config)
+
+proc logsCommand*(v: Values) =
+  initSpinoza()
+  let vmName =
+    if v.has("vmName"): v.get("vmName").getStr
+    else: ""
+  if vmName.len > 0:
+    discard loadVmState(vmName)
+    logsModule.tail(vmLogPath(vmName))
+  elif fileExists(findConfig()):
+    let config = findAndLoadConfig()
+    logsModule.tail(vmLogPath(config.name))
+  else:
+    displayError("No VM specified and no Spinozafile found")
 
 proc statusCommand*(v: Values) =
   initSpinoza()
@@ -169,6 +185,8 @@ when isMainModule:
         ## Resume a suspended VM
       ssh ?string(vmName):
         ## Connect to the VM via SSH
+      logs ?string(vmName):
+        ## Stream the VM console log (live)
       status:
         ## List all managed VMs and their state
 

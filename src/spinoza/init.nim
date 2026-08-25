@@ -17,12 +17,11 @@ name: $2
 memory: $3
 cpus: $4
 network:
-  subnet: $5
+  mode: $5
 ssh_config:
-  port: $6
-  user: $7
-  password: $8
-$9"""
+  user: $6
+  password: $7
+$8"""
 
 proc initCommand*(v: Values) =
   ## Create a Spinozafile in the current directory
@@ -51,8 +50,10 @@ proc initCommand*(v: Values) =
     displayWarning("Memory " & memory & " MB uses more than 70% of host RAM (" & $hostRam & " MB)")
 
   let cpus = prompt("CPUs", default = "2")
-  let subnet = prompt("Network subnet", default = "192.168.122")
-  let sshPort = prompt("SSH port", default = "2222")
+  let netMode = prompt("Network mode (user/shared/host)", default = "user")
+  if netMode.toLowerAscii() notin ["user", "shared", "host"]:
+    displayError("Invalid network mode '" & netMode & "' (expected: user, shared, or host)")
+    return
   let sshUser = prompt("SSH user", default = "vagrant")
   let sshPass = promptSecret("SSH password")
 
@@ -75,7 +76,7 @@ proc initCommand*(v: Values) =
     sharedSection = "shared_folders:\n" & sharedFoldersBlock
 
   let content = spinozafileTemplate % [
-    box, name, memory, cpus, subnet, sshPort, sshUser,
+    box, name, memory, cpus, netMode.toLowerAscii(), sshUser,
     if sshPass.len > 0: sshPass else: "vagrant",
     sharedSection
   ]

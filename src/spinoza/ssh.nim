@@ -5,23 +5,64 @@
 #          Made by Humans from OpenPeeps
 #          https://github.com/openpeeps/spinoza
 
-import std/[net, os, posix, termios, times, terminal]
+import std/[net, options, os, posix, termios, times, terminal]
 import libssh2
 
 import ./config
 import ./store
 
-proc probeSsh*(host: string, port: int, user, pass: string, timeoutSec = 120): bool =
+proc setFdBlocking(fd: SocketHandle, blocking: bool) =
+  let flags = fcntl(fd.cint, F_GETFL)
+  if blocking:
+    discard fcntl(fd.cint, F_SETFL, flags and not O_NONBLOCK)
+  else:
+    discard fcntl(fd.cint, F_SETFL, flags or O_NONBLOCK)
+
+proc tryTcpConnect*(host: string, port: int, timeoutMs = 1000): Socket =
+  ## Non-blocking TCP connect with a hard per-attempt timeout.
+  ## Returns the connected (blocking again) socket or nil.
+  var sock = newSocket()
+  let fd = sock.getFd()
+  setFdBlocking(fd, false)
+  try:
+    sock.connect(host, Port(port))
+  except OSError:
+    let err = osLastError()
+    if err != EINPROGRESS.OSErrorCode:
+      sock.close()
+      return nil
+    # Wait for writability within the timeout
+    var wfds: TFdSet
+    FD_ZERO(wfds)
+    FD_SET(fd, wfds)
+    var tv = Timeval(tv_sec: posix.Time(timeoutMs div 1000),
+                     tv_usec: Suseconds((timeoutMs mod 1000) * 1000))
+    let r = select(cint(fd) + 1, nil, addr wfds, nil, addr tv)
+    if r <= 0:
+      sock.close()
+      return nil
+    var soErr: cint
+    var slen: SockLen = SockLen(sizeof(soErr))
+    discard getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soErr, addr slen)
+    if soErr != 0:
+      sock.close()
+      return nil
+  setFdBlocking(fd, true)
+  return sock
+
+proc probeSsh*(host: string, port: int, user, pass: string, timeoutSec = 120,
+               onWait: proc(seconds: int) {.closure.} = nil): bool =
   ## Attempt an actual SSH handshake + auth to verify the VM is ready.
   ## Returns true once a full auth succeeds, false on timeout.
+  ## `onWait` fires after each failed attempt with elapsed seconds.
   discard libssh2.init(0)
   defer: libssh2.exit()
 
-  let deadline = now() + initDuration(seconds = timeoutSec)
+  let start = now()
+  let deadline = start + initDuration(seconds = timeoutSec)
   while now() < deadline:
-    var sock = newSocket()
-    try:
-      sock.connect(host, Port(port))
+    var sock = tryTcpConnect(host, port)
+    if sock != nil:
       let sockFd = sock.getFd()
 
       var session = sessionInit()
@@ -35,9 +76,9 @@ proc probeSsh*(host: string, port: int, user, pass: string, timeoutSec = 120): b
         discard session.sessionFree()
 
       sock.close()
-    except CatchableError:
-      discard
-    sleep(3000)
+    if onWait != nil:
+      onWait((now() - start).inSeconds.int)
+    sleep(500)
   false
 
 proc sshExec*(host: string, port: int, user, pass, cmd: string): string =
@@ -106,127 +147,24 @@ proc waitsocket(sockFd: SocketHandle, session: Session): cint =
   var timeout = Timeval(tv_sec: posix.Time(0), tv_usec: 50000) # 50ms
   result = select(cint(sockFd) + 1, readFds, writeFds, nil, addr timeout)
 
-proc ssh*(config: SpinozaConfig) =
-  let hostname = "127.0.0.1"
-  let port = config.ssh_config.port
-  let username = config.ssh_config.user
-  let password = config.ssh_config.password
-
-  # Initialize libssh2
-  discard libssh2.init(0)
-  defer: libssh2.exit()
-
-  # Create TCP socket and connect
-  var sock = newSocket()
-  defer: sock.close()
-  sock.connect(hostname, Port(port))
-  let sockFd = sock.getFd()
-
-  # Initialize SSH session
-  var session = sessionInit()
-  if session.sessionHandshake(sockFd) != 0:
-    raise newException(IOError, "SSH handshake failed")
-  defer:
-    discard session.sessionDisconnect("bye")
-    discard session.sessionFree()
-
-  # Authenticate
-  if session.userauthPassword(username, password, nil) != 0:
-    raise newException(IOError, "SSH authentication failed for " & username)
-
-  # Open channel
-  var channel = session.channelOpenSession()
-  if channel.isNil:
-    raise newException(IOError, "Failed to open SSH channel")
-  defer: discard channel.channelFree()
-
-  # Request PTY with terminal size
-  let (cols, rows) = getTerminalSize()
-  if channel.channelRequestPty("xterm-256color") != 0:
-    raise newException(IOError, "Failed to request PTY")
-  discard channel.channelRequestPtySize(cols, rows)
-
-  # Request shell
-  if channel.channelShell() != 0:
-    raise newException(IOError, "Failed to request shell")
-
-  # Save terminal settings and switch to raw mode
-  var origTerm: Termios
-  discard tcGetAttr(0, addr origTerm)
-  defer: discard tcSetAttr(0, TCSANOW, addr origTerm)
-
-  var rawTerm = origTerm
-  rawTerm.c_lflag = rawTerm.c_lflag and not (ECHO or ICANON or IEXTEN or ISIG)
-  rawTerm.c_iflag = rawTerm.c_iflag and not (IXON or ICRNL or BRKINT or INLCR or IGNBRK or PARMRK or ISTRIP or IGNCR)
-  rawTerm.c_oflag = rawTerm.c_oflag or OPOST
-  rawTerm.c_cc[VMIN] = '\1'
-  rawTerm.c_cc[VTIME] = '\0'
-  discard tcSetAttr(0, TCSANOW, addr rawTerm)
-
-  # Set channel and session to non-blocking
-  channel.channelSetBlocking(0)
-  session.sessionSetBlocking(0)
-
-  # I/O loop — canonical libssh2 pattern
-  var buf: array[4096, char]
-  var stdinClosed = false
-
-  while true:
-    # Wait on SSH socket in the direction libssh2 needs
-    discard waitsocket(sockFd, session)
-
-    # Drain channel → stdout
-    while true:
-      let rc = channel.channelRead(addr buf[0], 4096)
-      if rc > 0:
-        discard write(1, addr buf[0], rc)
-      elif rc == 0:
-        # Channel EOF or closed
-        return
-      else:
-        let err = session.sessionLastErrno()
-        if err != LIBSSH2_ERROR_EAGAIN:
-          return
-        break
-
-    # Read stdin → channel (POSIX poll on fd 0 only)
-    if not stdinClosed:
-      var stdinPoll: TPollfd
-      stdinPoll.fd = cint(0)
-      stdinPoll.events = POLLIN
-      stdinPoll.revents = 0
-      if posix.poll(addr stdinPoll, 1, 0) > 0:
-        let n = read(0, addr buf[0], 4096)
-        if n > 0:
-          var written = 0
-          while written < n:
-            let rc = channel.channelWrite(cast[cstring](addr buf[written]), n - written)
-            if rc > 0:
-              written += rc
-            elif rc == 0:
-              stdinClosed = true
-              break
-            else:
-              let err = session.sessionLastErrno()
-              if err != LIBSSH2_ERROR_EAGAIN:
-                stdinClosed = true
-              break
-        elif n == 0:
-          discard channel.channelSendEof()
-          stdinClosed = true
-
 proc sshFromStore*(state: VmState) =
-  let hostname = "127.0.0.1"
+  let hostname = state.sshHost
   let port = state.sshPort
   let username = state.sshUser
   let password = state.sshPass
+  if hostname.len == 0:
+    raise newException(IOError,
+      "SSH endpoint unknown for '" & state.name & "'. Run 'spinoza up' first.")
 
   discard libssh2.init(0)
   defer: libssh2.exit()
 
-  var sock = newSocket()
+  var sock = tryTcpConnect(hostname, port)
+  if sock.isNil:
+    raise newException(IOError,
+      "Could not connect to " & hostname & ":" & $port &
+      ". Is the VM running?")
   defer: sock.close()
-  sock.connect(hostname, Port(port))
   let sockFd = sock.getFd()
 
   var session = sessionInit()
@@ -309,3 +247,12 @@ proc sshFromStore*(state: VmState) =
         elif n == 0:
           discard channel.channelSendEof()
           stdinClosed = true
+
+proc ssh*(config: SpinozaConfig) {.used.} =
+  ## Connect using the endpoint recorded by `spinoza up`.
+  let stored = loadVm(config.name)
+  if stored.isSome:
+    sshFromStore(stored.get())
+  else:
+    raise newException(IOError,
+      "No boot record for '" & config.name & "'. Run 'spinoza up' first.")

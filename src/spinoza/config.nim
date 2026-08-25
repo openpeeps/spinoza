@@ -15,12 +15,12 @@ export paths
 
 type
   SshConfig* = object
-    port*: int
     user*: string
     password*: string
 
   NetworkConfig* = object
-    subnet*: string
+    mode*: string          ## "user" (SLIRP + forwarded port) | "shared" | "host" (socket_vmnet)
+    socket_path*: string   ## Optional override of the socket_vmnet unix socket
 
   SharedFolder* = object
     host*: string
@@ -49,6 +49,27 @@ proc getHostRamMB*(): int =
   else:
     result = 0
 
+proc netMode*(n: NetworkConfig): string =
+  ## Normalized network mode. Defaults to "user".
+  let m = n.mode.toLowerAscii()
+  if m.len == 0: "user" else: m
+
+proc defaultSocketPath*(mode: string): string =
+  ## Default socket_vmnet unix socket for a given mode name.
+  ## MacPorts installs under /opt/local; upstream and Homebrew use /var/run.
+  let prefix =
+    if fileExists("/opt/local/bin/socket_vmnet_client"): "/opt/local/var/run"
+    else: "/var/run"
+  case mode
+  of "host": prefix & "/socket_vmnet-host"
+  else: prefix & "/socket_vmnet"
+
+proc resolveSocketPath*(n: NetworkConfig): string =
+  ## Resolve the socket_vmnet unix socket for vmnet modes.
+  if n.socket_path.len > 0:
+    return n.socket_path
+  n.netMode().defaultSocketPath()
+
 proc validateConfig*(config: SpinozaConfig) =
   ## Validate memory requirements against host RAM.
   let hostRam = getHostRamMB()
@@ -63,6 +84,12 @@ proc validateConfig*(config: SpinozaConfig) =
 
   if hostRam > 0 and config.memory > int(hostRam.float * 0.70):
     displayWarning(fmt"Memory {config.memory} MB uses more than 70% of host RAM ({hostRam} MB)")
+
+  let mode = config.network.netMode()
+  if mode notin ["user", "shared", "host"]:
+    raise newException(ValueError,
+      "Invalid network.mode '" & mode &
+      "' (expected: user, shared, or host)")
 
 proc loadConfig*(path: string): SpinozaConfig =
   parseYAML(readFile(path), SpinozaConfig)

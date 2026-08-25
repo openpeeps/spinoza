@@ -12,6 +12,7 @@ const
   spinozaDirName* = ".spinoza"
   boxesDirName* = "boxes"
   vmsDirName* = "vms"
+  logsDirName* = "logs"
   settingsFileName* = "settings.json"
   defaultConfigName* = "Spinozafile"
 
@@ -44,3 +45,11 @@ proc vmDbPath*(): string =
   let base = getHomeDir() / spinozaDirName / vmsDirName
   createDir(base)
   base / "spinoza"
+
+proc logsDir*(): string =
+  let base = getHomeDir() / spinozaDirName / logsDirName
+  createDir(base)
+  base
+
+proc vmLogPath*(name: string): string =
+  logsDir() / (name & ".log")

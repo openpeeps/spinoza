@@ -5,12 +5,14 @@
 #          Made by Humans from OpenPeeps
 #          https://github.com/openpeeps/spinoza
 
-import std/[os, times, strutils]
+import std/[net, options, os, osproc, posix, strutils, times]
 import libvirt
 import flysystem
 import pkg/kapsis/interactive/prompts
 
 import ./config
+import ./logs
+import ./network
 import ./paths
 import ./store
 import ./ssh as sshModule
@@ -37,6 +39,44 @@ done
 exec "$QEMU_BIN" "$@"
 """
 
+const qemuVmnetWrapper = """#!/bin/sh
+# Spinoza vmnet networking wrapper.
+# - Routes through socket_vmnet_client ONLY when the command line actually
+#   references the vmnet netdev (fd=3), so libvirt's capability probes
+#   (-help/-machine help/etc.) never require the daemon.
+# - Rewrites accel=hvf to accel=tcg for hosts without working Hypervisor.framework.
+set -e
+QEMU_BIN="__QEMU_BIN__"
+CLIENT="__VMNET_CLIENT__"
+SOCKET="__VMNET_SOCKET__"
+
+rewrite() {
+  case "$1" in
+    *accel=hvf*)
+      printf '%s' "$1" | sed 's/accel=hvf:tcg/accel=tcg/g; s/accel=hvf/accel=tcg/g'
+      ;;
+    *)
+      printf '%s' "$1"
+      ;;
+  esac
+}
+
+NEEDS_NET=0
+for arg in "$@"; do
+  case "$arg" in
+    *fd=3*|*id=hostnet0*) NEEDS_NET=1 ;;
+  esac
+  set -- "$@" "$(rewrite "$arg")"
+  shift
+done
+
+if [ "$NEEDS_NET" = "1" ]; then
+  exec "$CLIENT" "$SOCKET" "$QEMU_BIN" "$@"
+else
+  exec "$QEMU_BIN" "$@"
+fi
+"""
+
 proc wrapperPath(): string =
   let p = getEnv("LIBVIRT_QEMUWrapper")
   if p.len > 0: p
@@ -52,13 +92,69 @@ proc wrapperPath(): string =
   else:
     findExe("qemu-system-x86_64")
 
+proc pathPresent(p: string): bool =
+  ## True for any existing path (files, dirs, unix sockets).
+  var s: Stat
+  result = stat(p.cstring, s) == 0
+
+proc vmnetWrapperPath(socketPath: string): string =
+  ## Emulator shim routing QEMU through socket_vmnet_client for vmnet modes.
+  when defined(macosx):
+    if not pathPresent(socketPath):
+      raise newException(IOError,
+        "socket_vmnet socket not found at " & socketPath & ".\n" &
+        "Start the daemon with: sudo port load socket_vmnet\n" &
+        "(see the Networking section of the README)")
+    let client = findExe("socket_vmnet_client")
+    if client.len == 0:
+      raise newException(IOError,
+        "socket_vmnet_client not found in PATH.\n" &
+        "Install it with: sudo port install socket_vmnet")
+    let qemuBin = findExe("qemu-system-x86_64")
+    if qemuBin.len == 0:
+      raise newException(IOError, "qemu-system-x86_64 not found in PATH")
+    let wrapper = getHomeDir() / ".spinoza" / "qemu-vmnet.sh"
+    writeFile(wrapper, qemuVmnetWrapper
+      .replace("__VMNET_CLIENT__", client)
+      .replace("__VMNET_SOCKET__", socketPath)
+      .replace("__QEMU_BIN__", qemuBin))
+    discard execShellCmd("chmod +x " & wrapper)
+    wrapper
+  else:
+    raise newException(NotImplementedError,
+      "vmnet networking is only available on macOS")
+
+proc freeTcpPort*(): int =
+  ## Ask the kernel for a free TCP port by binding port 0 on loopback.
+  var sock = newSocket()
+  sock.bindAddr(Port(0), "127.0.0.1")
+  let port = sock.getLocalAddr()[1].int
+  sock.close()
+  port
+
 proc resolveBoxPath*(config: SpinozaConfig): string =
   let disk = fs.rawDisk("boxes")
   disk.root / boxPath(config.box)
 
-proc domainXml*(config: SpinozaConfig, boxPath: string): string =
+proc isVmnetMode*(mode: string): bool = mode in ["shared", "host"]
+
+proc netdevArgs(mode: string, forwardedPort: int, mac: string): seq[string] =
+  ## QEMU networking args for the requested mode.
+  if mode == "user":
+    @["-netdev", "user,id=hostnet0,hostfwd=tcp::" & $forwardedPort & "-:22",
+      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"]
+  else:
+    var dev = "virtio-net-pci,netdev=hostnet0,addr=0x7"
+    if mac.len > 0:
+      dev.add ",mac=" & mac
+    # fd 3 is handed over by socket_vmnet_client (see qemu-vmnet.sh wrapper)
+    @["-netdev", "socket,id=hostnet0,fd=3", "-device", dev]
+
+proc domainXml*(config: SpinozaConfig, boxPath: string,
+                vmUuid: string, forwardedPort: int): string =
   let mem = $(config.memory * 1024)
-  let sshPort = $config.ssh_config.port
+  let mode = config.network.netMode()
+  let mac = deriveMac(vmUuid)
   var d = LibvirtDomain(
     virtType: "qemu",
     metadata: LibvirtMetadata(name: config.name),
@@ -72,25 +168,22 @@ proc domainXml*(config: SpinozaConfig, boxPath: string): string =
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
-    emulator: wrapperPath(),
+    emulator: if isVmnetMode(mode): vmnetWrapperPath(config.network.resolveSocketPath())
+              else: wrapperPath(),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
       sourceFile: boxPath,
       targetDev: "vda", targetBus: "virtio"
     )],
-    serials: @[LibvirtSerial(sourceType: "pty", targetPort: "0")],
-    consoles: @[LibvirtConsole(
-      sourceType: "pty", targetType: "serial", targetPort: "0"
+    serials: @[LibvirtSerial(
+      sourceType: "file", sourcePath: vmLogPath(config.name), targetPort: "0"
     )],
     channels: @[LibvirtChannel(
       channelType: "unix", sourceMode: "bind",
       targetType: "virtio", targetName: "org.qemu.guest_agent.0"
     )],
-    qemuArgs: @[
-      "-netdev", "user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22",
-      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"
-    ]
+    qemuArgs: netdevArgs(mode, forwardedPort, mac)
   )
   when defined(macosx):
     if config.shared_folders.len > 0:
@@ -119,6 +212,69 @@ proc cleanup*(conn: Connect, domainName: string) =
   except LibvirtError:
     discard
 
+proc autoMountSharedFolders(host: string, port: int, user, pass: string,
+                            folders: seq[SharedFolder]) =
+  ## Mount configured shared folders inside the guest over SSH.
+  for f in folders:
+    let mkdirCmd = "sudo mkdir -p /mnt/" & f.tag
+    let mountCmd =
+      when defined(macosx):
+        "sudo mount -t 9p -o trans=virtio " & f.tag & " /mnt/" & f.tag
+      else:
+        "sudo mount -t virtiofs " & f.tag & " /mnt/" & f.tag
+    discard sshModule.sshExec(host, port, user, pass, mkdirCmd)
+    discard sshModule.sshExec(host, port, user, pass, mountCmd)
+
+proc waitUntilReady(spinny: ptr Spinny, name: string, host: string,
+                    port: int, user, pass: string, timeoutSec = 120): bool =
+  ## Poll SSH readiness while streaming guest serial-console output
+  ## above the spinner, so slow (TCG) boots never look stuck.
+  var lf: File = nil
+  var lpos = 0
+  var hinted = false
+  var seenBytes = false
+
+  proc onWait(seconds: int) =
+    let chunk = pumpLog(vmLogPath(name), lf, lpos)
+    if chunk.len > 0:
+      seenBytes = true
+      for line in chunk.splitLines():
+        if line.strip().len > 0:
+          spinny[].log(line)
+    if not hinted and not seenBytes and seconds >= 15:
+      spinny[].log("no serial output yet - this box may need console=ttyS0 (see README)")
+      hinted = true
+
+  defer:
+    if not lf.isNil: lf.close()
+
+  result = sshModule.probeSsh(host, port, user, pass, timeoutSec, onWait)
+
+proc resolveEndpoint(mode, name, uuid: string,
+                     forwardedPort: int): tuple[host: string, port: int] =
+  ## SSH endpoint for a VM. vmnet IPs are empty until discovered post-boot.
+  if isVmnetMode(mode):
+    result = ("", 22)
+  else:
+    result = ("127.0.0.1", forwardedPort)
+
+proc discoverEndpoint(spinny: var Spinny, mode, name,
+                      mac: string): tuple[host: string, port: int] =
+  ## Resolve the guest IP for vmnet modes via ARP; passthrough otherwise.
+  if isVmnetMode(mode):
+    let ip = discoverVmIp(mac)
+    if ip.len == 0:
+      spinny.error("Could not discover the guest IP for " & name &
+        ".\nIs socket_vmnet running? For a static IP, reserve the MAC " &
+        mac & " in /etc/bootptab (see README).")
+      return ("", 0)
+    updateEndpoint(name, ip, 22)
+    return (ip, 22)
+  let state = loadVm(name)
+  if state.isSome:
+    return (state.get().sshHost, state.get().sshPort)
+  return ("127.0.0.1", 22)
+
 proc up*(config: SpinozaConfig) =
   let conn = openConnect("qemu:///session")
   defer: conn.close
@@ -127,46 +283,53 @@ proc up*(config: SpinozaConfig) =
   if not fileExists(bpath):
     raise newException(IOError, "Box image not found: " & bpath)
 
+  let mode = config.network.netMode()
+  let uuid =
+    block:
+      let existing = loadVm(config.name)
+      if existing.isSome: existing.get().uuid else: newVmUuid()
+  let hostPort = if isVmnetMode(mode): 0 else: freeTcpPort()
+
   cleanup(conn, config.name)
-  let dom = conn.defineDomainXML(domainXml(config, bpath))
+  let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
   dom.create
 
-  let uuid = newVmUuid()
+  let (sshHost, sshPort) = resolveEndpoint(mode, config.name, uuid, hostPort)
   var state = VmState(
     uuid: uuid,
     box: config.box,
     name: config.name,
     memory: config.memory,
     cpus: config.cpus,
-    sshPort: config.ssh_config.port,
+    netMode: mode,
+    sshHost: sshHost,
+    sshPort: sshPort,
     sshUser: config.ssh_config.user,
     sshPass: config.ssh_config.password,
-    subnet: config.network.subnet,
     sharedFolders: config.shared_folders,
     status: "running"
   )
   saveVm(state)
 
-  var spinny = newSpinny("Spinning up " & config.name & "...", "dots")
+  var spinny = newSpinny("Spinning up " & config.name & "...", "dots", time = true)
   spinny.start()
 
-  let vmReady = sshModule.probeSsh("127.0.0.1", config.ssh_config.port,
+  var (host, port) = (sshHost, sshPort)
+  if isVmnetMode(mode):
+    (host, port) = spinny.discoverEndpoint(mode, config.name, deriveMac(uuid))
+    if host.len == 0:
+      return
+    spinny.setText("Guest at " & host & " - waiting for sshd...")
+  else:
+    spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
+
+  let vmReady = waitUntilReady(addr spinny, config.name, host, port,
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
-    if config.shared_folders.len > 0:
-      for f in config.shared_folders:
-        let mkdirCmd = "sudo mkdir -p /mnt/" & f.tag
-        let mountCmd =
-          when defined(macosx):
-            "sudo mount -t 9p -o trans=virtio " & f.tag & " /mnt/" & f.tag
-          else:
-            "sudo mount -t virtiofs " & f.tag & " /mnt/" & f.tag
-        discard sshModule.sshExec("127.0.0.1", config.ssh_config.port,
-          config.ssh_config.user, config.ssh_config.password, mkdirCmd)
-        discard sshModule.sshExec("127.0.0.1", config.ssh_config.port,
-          config.ssh_config.user, config.ssh_config.password, mountCmd)
-    spinny.success(config.name & " is ready on 127.0.0.1:" & $config.ssh_config.port)
+    autoMountSharedFolders(host, port,
+      config.ssh_config.user, config.ssh_config.password, config.shared_folders)
+    spinny.success(config.name & " is ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & config.name & " to start")
 
@@ -178,6 +341,7 @@ proc halt*(config: SpinozaConfig, force: bool = false) =
     let dom = conn.lookupDomainByName(config.name)
     if dom.isActive:
       dom.destroy
+      updateStatus(config.name, "stopped")
     elif not force:
       return
   except LibvirtError:
@@ -202,7 +366,6 @@ proc status*(config: SpinozaConfig) =
 
 proc domainXmlFromState*(state: VmState, boxPath: string): string =
   let mem = $(state.memory * 1024)
-  let sshPort = $state.sshPort
   var d = LibvirtDomain(
     virtType: "qemu",
     metadata: LibvirtMetadata(name: state.name),
@@ -216,25 +379,22 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
-    emulator: wrapperPath(),
+    emulator: if isVmnetMode(state.netMode): vmnetWrapperPath(state.netMode.defaultSocketPath())
+              else: wrapperPath(),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
       sourceFile: boxPath,
       targetDev: "vda", targetBus: "virtio"
     )],
-    serials: @[LibvirtSerial(sourceType: "pty", targetPort: "0")],
-    consoles: @[LibvirtConsole(
-      sourceType: "pty", targetType: "serial", targetPort: "0"
+    serials: @[LibvirtSerial(
+      sourceType: "file", sourcePath: vmLogPath(state.name), targetPort: "0"
     )],
     channels: @[LibvirtChannel(
       channelType: "unix", sourceMode: "bind",
       targetType: "virtio", targetName: "org.qemu.guest_agent.0"
     )],
-    qemuArgs: @[
-      "-netdev", "user,id=hostnet0,hostfwd=tcp::" & sshPort & "-:22",
-      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"
-    ]
+    qemuArgs: netdevArgs(state.netMode, state.sshPort, deriveMac(state.uuid))
   )
   when defined(macosx):
     if state.sharedFolders.len > 0:
@@ -271,25 +431,26 @@ proc upFromStore*(state: VmState) =
   dom.create
   updateStatus(state.name, "running")
 
-  var spinny = newSpinny("Spinning up " & state.name & "...", "dots")
+  var spinny = newSpinny("Spinning up " & state.name & "...", "dots", time = true)
   spinny.start()
 
-  let vmReady = sshModule.probeSsh("127.0.0.1", state.sshPort, state.sshUser, state.sshPass)
+  var (host, port) = (state.sshHost, state.sshPort)
+  if isVmnetMode(state.netMode):
+    (host, port) = spinny.discoverEndpoint(state.netMode, state.name,
+      deriveMac(state.uuid))
+    if host.len == 0:
+      return
+    spinny.setText("Guest at " & host & " - waiting for sshd...")
+  else:
+    spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
+
+  let vmReady = waitUntilReady(addr spinny, state.name, host, port,
+    state.sshUser, state.sshPass)
 
   if vmReady:
-    if state.sharedFolders.len > 0:
-      for f in state.sharedFolders:
-        let mkdirCmd = "sudo mkdir -p /mnt/" & f.tag
-        let mountCmd =
-          when defined(macosx):
-            "sudo mount -t 9p -o trans=virtio " & f.tag & " /mnt/" & f.tag
-          else:
-            "sudo mount -t virtiofs " & f.tag & " /mnt/" & f.tag
-        discard sshModule.sshExec("127.0.0.1", state.sshPort,
-          state.sshUser, state.sshPass, mkdirCmd)
-        discard sshModule.sshExec("127.0.0.1", state.sshPort,
-          state.sshUser, state.sshPass, mountCmd)
-    spinny.success(state.name & " is ready on 127.0.0.1:" & $state.sshPort)
+    autoMountSharedFolders(host, port, state.sshUser, state.sshPass,
+      state.sharedFolders)
+    spinny.success(state.name & " is ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & state.name & " to start")
 
@@ -311,7 +472,7 @@ proc reload*(config: SpinozaConfig) =
   let conn = openConnect("qemu:///session")
   defer: conn.close
 
-  var spinny = newSpinny("Reloading " & config.name & "...", "dots")
+  var spinny = newSpinny("Reloading " & config.name & "...", "dots", time = true)
   spinny.start()
 
   try:
@@ -346,15 +507,50 @@ proc reload*(config: SpinozaConfig) =
     spinny.error("Box image not found: " & bpath)
     return
 
-  let dom = conn.defineDomainXML(domainXml(config, bpath))
+  let mode = config.network.netMode()
+  let uuid =
+    block:
+      let existing = loadVm(config.name)
+      if existing.isSome: existing.get().uuid else: newVmUuid()
+  let hostPort = if isVmnetMode(mode): 0 else: freeTcpPort()
+
+  let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
   dom.create
+
+  let (sshHost, sshPort) = resolveEndpoint(mode, config.name, uuid, hostPort)
+  block persistState:
+    var state = VmState(
+      uuid: uuid,
+      box: config.box,
+      name: config.name,
+      memory: config.memory,
+      cpus: config.cpus,
+      netMode: mode,
+      sshHost: sshHost,
+      sshPort: sshPort,
+      sshUser: config.ssh_config.user,
+      sshPass: config.ssh_config.password,
+      sharedFolders: config.shared_folders,
+      status: "running"
+    )
+    saveVm(state)
+
+  var (host, port) = (sshHost, sshPort)
+  if isVmnetMode(mode):
+    (host, port) = spinny.discoverEndpoint(mode, config.name, deriveMac(uuid))
+    if host.len == 0:
+      return
+    spinny.setText("Guest at " & host & " - waiting for sshd...")
+  else:
+    spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
+
   updateStatus(config.name, "running")
 
-  let vmReady = sshModule.probeSsh("127.0.0.1", config.ssh_config.port,
+  let vmReady = waitUntilReady(addr spinny, config.name, host, port,
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
-    spinny.success(config.name & " reloaded and ready on 127.0.0.1:" & $config.ssh_config.port)
+    spinny.success(config.name & " reloaded and ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & config.name & " to restart")
 
@@ -362,7 +558,7 @@ proc reloadFromStore*(state: VmState) =
   let conn = openConnect("qemu:///session")
   defer: conn.close
 
-  var spinny = newSpinny("Reloading " & state.name & "...", "dots")
+  var spinny = newSpinny("Reloading " & state.name & "...", "dots", time = true)
   spinny.start()
 
   try:
@@ -401,10 +597,21 @@ proc reloadFromStore*(state: VmState) =
   dom.create
   updateStatus(state.name, "running")
 
-  let vmReady = sshModule.probeSsh("127.0.0.1", state.sshPort, state.sshUser, state.sshPass)
+  var (host, port) = (state.sshHost, state.sshPort)
+  if isVmnetMode(state.netMode):
+    (host, port) = spinny.discoverEndpoint(state.netMode, state.name,
+      deriveMac(state.uuid))
+    if host.len == 0:
+      return
+    spinny.setText("Guest at " & host & " - waiting for sshd...")
+  else:
+    spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
+
+  let vmReady = waitUntilReady(addr spinny, state.name, host, port,
+    state.sshUser, state.sshPass)
 
   if vmReady:
-    spinny.success(state.name & " reloaded and ready on 127.0.0.1:" & $state.sshPort)
+    spinny.success(state.name & " reloaded and ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & state.name & " to restart")
 

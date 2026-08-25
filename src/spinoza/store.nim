@@ -19,11 +19,11 @@ type
     name*: string
     memory*: int
     cpus*: int
+    netMode*: string
     sshHost*: string
     sshPort*: int
     sshUser*: string
     sshPass*: string
-    subnet*: string
     sharedFolders*: seq[SharedFolder]
     status*: string
 
@@ -57,11 +57,11 @@ proc saveVm*(state: VmState) =
     "name": state.name,
     "memory": state.memory,
     "cpus": state.cpus,
+    "net_mode": state.netMode,
     "ssh_host": state.sshHost,
     "ssh_port": state.sshPort,
     "ssh_user": state.sshUser,
     "ssh_pass": state.sshPass,
-    "subnet": state.subnet,
     "shared_folders": folders,
     "status": state.status
   })
@@ -84,11 +84,11 @@ proc loadVm*(name: string): Option[VmState] =
     name: node["name"].getStr,
     memory: node["memory"].getInt.int,
     cpus: node["cpus"].getInt.int,
-    sshHost: node{"ssh_host"}.getStr(""),
-    sshPort: node{"ssh_port"}.getInt.int,
+    netMode: node{"net_mode"}.getStr("user"),
+    sshHost: node{"ssh_host"}.getStr("127.0.0.1"),
+    sshPort: node{"ssh_port"}.getInt(22).int,
     sshUser: node["ssh_user"].getStr,
     sshPass: node["ssh_pass"].getStr,
-    subnet: node["subnet"].getStr,
     sharedFolders: folders,
     status: node["status"].getStr
   ))
@@ -112,11 +112,11 @@ proc listVms*(): seq[VmState] =
         name: node["name"].getStr,
         memory: node["memory"].getInt.int,
         cpus: node["cpus"].getInt.int,
-        sshHost: node{"ssh_host"}.getStr(""),
-        sshPort: node{"ssh_port"}.getInt.int,
+        netMode: node{"net_mode"}.getStr("user"),
+        sshHost: node{"ssh_host"}.getStr("127.0.0.1"),
+        sshPort: node{"ssh_port"}.getInt(22).int,
         sshUser: node["ssh_user"].getStr,
         sshPass: node["ssh_pass"].getStr,
-        subnet: node["subnet"].getStr,
         sharedFolders: folders,
         status: node["status"].getStr
       )
@@ -129,4 +129,13 @@ proc updateStatus*(name: string, status: string) =
   if state.isSome:
     var updated = state.get()
     updated.status = status
+    saveVm(updated)
+
+proc updateEndpoint*(name: string, host: string, port: int) =
+  ## Persist the SSH endpoint (used after vmnet IP discovery).
+  let state = loadVm(name)
+  if state.isSome:
+    var updated = state.get()
+    updated.sshHost = host
+    updated.sshPort = port
     saveVm(updated)

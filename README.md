@@ -30,10 +30,11 @@ Inspired by Vagrant, but without the Ruby overhead. Spinoza talks directly to li
 - **VM registry** named VMs stored in a local boogie KV store
 - **Full VM lifecycle** boot, halt, reload, destroy, suspend, and resume
 - **Box management** download, list, and remove qcow2 box images (local files and URLs)
-- **Shared folders** mount host directories inside the VM via virtiofs
+- **Shared folders** mount host directories inside the VM via virtiofs (Linux) or 9p (macOS)
 - **Memory validation** enforces minimum 1 GB, checks against host RAM, warns at 70% usage
 - **QEMU TCG fallback** auto-generated wrapper on macOS when hardware acceleration is unavailable
-- **Flysystem-backed storage** atomic file operations for boxes and VM state
+- **Pluggable networking** SLIRP with dynamic forwarded ports, or true per-VM `192.168.x.x` IPs on macOS via [socket_vmnet](https://github.com/lima-vm/socket_vmnet)
+- **Live console logs** `spinoza logs` streams guest boot output from a file-backed serial console
 
 ### Prerequisites
 You will need to install `libvirt`, `QEMU`, and `libssh2`.
@@ -74,7 +75,10 @@ spinoza ssh
 
 ```bash
 # If shared_folders are configured in Spinozafile:
-sudo mount -t virtiofs <tag> /mnt/shared
+# Linux (virtiofs):
+sudo mount -t virtiofs <tag> /mnt/<tag>
+# macOS (9p):
+sudo mount -t 9p -o trans=virtio <tag> /mnt/<tag>
 ```
 
 **6. Shut down**
@@ -91,19 +95,131 @@ name: spinoza-debian          # Unique VM identifier
 memory: 2048                  # RAM in megabytes (min 1024)
 cpus: 2                       # Number of virtual CPUs
 network:
-  subnet: 192.168.122         # Subnet for NAT network
+  mode: user                  # user | shared | host (see Networking)
 ssh_config:
-  port: 2222                  # Host port forwarded to guest SSH
   user: vagrant               # SSH username
   password: vagrant           # SSH password
-shared_folders:               # Optional: mount host dirs via virtiofs
+shared_folders:               # Optional: mount host dirs
   - host: /Users/<username>/code    # Host directory path
     tag: code                       # Mount tag used in guest
   - host: /Users/<username>/data
     tag: data
 ```
 
-Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza/vms/`.
+Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza/vms/`. Console logs are written to `~/.spinoza/logs/<name>.log`.
+
+## Networking
+
+Spinoza supports three network modes via `network.mode` in the Spinozafile:
+
+| Mode | Guest IP | Internet (guest) | Host → guest access | Requires |
+|---|---|---|---|---|
+| `user` (default) | `127.0.0.1` + auto-allocated forwarded port | Yes | Yes (forwarded port) | Nothing, works everywhere |
+| `shared` | Real DHCP'd IP (e.g. `192.168.105.x`) | Yes | Yes, direct IP | socket_vmnet daemon |
+| `host` | Real DHCP'd IP on a pinned subnet (`192.168.122.x`) | No | Yes, direct IP | socket_vmnet daemon |
+
+With `user` mode there is never a port conflict: at boot Spinoza asks the kernel for a free TCP port and forwards it to guest SSH. The endpoint is stored per VM, so `spinoza ssh` just works.
+
+With the vmnet modes every VM gets a genuine routable IP on your macOS host — the same model as VirtualBox host-only / Vagrant private networks.
+
+### macOS setup: socket_vmnet
+
+The `shared` and `host` modes use Apple's `vmnet` framework through [socket_vmnet](https://github.com/lima-vm/socket_vmnet), which is packaged by MacPorts. One-time setup:
+
+```bash
+# 1. Install
+sudo port selfupdate
+sudo port install socket_vmnet
+
+# 2. Start the shared-mode daemon (internet-enabled network)
+sudo port load socket_vmnet
+
+# 3. Verify it's listening
+ls -l /opt/local/var/run/socket_vmnet
+```
+
+MacPorts installs under `/opt/local`: binaries in `/opt/local/bin`, socket at `/opt/local/var/run/socket_vmnet` (gateway `192.168.105.1`, log at `/opt/local/var/log/socket_vmnet.log`). Spinoza detects the MacPorts layout automatically; upstream or Homebrew installs using `/var/run/socket_vmnet` work too, or set `network.socket_path` explicitly. To stop the daemon: `sudo port unload socket_vmnet`.
+
+**Host-only mode (pinned subnet):** create a second daemon instance on a fixed subnet by installing a plist like this as `/Library/LaunchDaemons/io.spinoza.socket-vmnet-host.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>io.spinoza.socket-vmnet-host</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/local/bin/socket_vmnet</string>
+    <string>--vmnet-mode=host</string>
+    <string>--vmnet-gateway=192.168.122.1</string>
+    <string>/opt/local/var/run/socket_vmnet-host</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>Sockets</key>
+  <dict>
+    <key>Listeners</key>
+    <dict>
+      <key>SockPathMode</key><integer>448</integer>
+      <key>SockPathName</key><string>/opt/local/var/run/socket_vmnet-host</string>
+      <key>SockType</key><string>stream</string>
+    </dict>
+  </dict>
+</dict>
+</plist>
+```
+
+```bash
+sudo mkdir -p /var/run
+sudo chown root:daemon /var/run
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.spinoza.socket-vmnet-host.plist
+sudo launchctl enable system/io.spinoza.socket-vmnet-host
+sudo launchctl kickstart -kp system/io.spinoza.socket-vmnet-host
+```
+
+**Static IPs:** each VM derives a deterministic MAC from its UUID (prefix `52:54:00`). To pin an IP, add a reservation to `/etc/bootptab` (keep the `%%` header):
+
+```
+%%
+# hostname      hwtype  hwaddr              ipaddr
+spinoza-debian  1       52:54:00:xx:yy:zz   192.168.122.10
+```
+
+then reload DHCP: `sudo /bin/launchctl kickstart -kp system/com.apple.bootpd`.
+
+Spinoza discovers each VM's IP automatically after boot by matching its MAC in the host ARP table; with a bootptab reservation you get the same address on every boot.
+
+**Troubleshooting:** if guests never get an IP, make sure `bootpd` isn't blocked by the application firewall:
+
+```bash
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/libexec/bootpd
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblock /usr/libexec/bootpd
+```
+
+Daemon-side debug output goes to `/opt/local/var/log/socket_vmnet.log` (MacPorts) or `/var/log/socket_vmnet/stderr` (upstream/Homebrew launchd).
+
+### Live console logs
+
+Every VM writes its serial console to `~/.spinoza/logs/<name>.log`. Stream it live (Ctrl-C to stop watching; the log file itself keeps growing):
+
+```bash
+spinoza logs            # VM from Spinozafile
+spinoza logs my-vm      # named VM from registry
+```
+
+> [!NOTE]
+> Console output only appears if the guest OS writes to its first serial port (`ttyS0`). Most cloud/Vagrant images do; stock installs may need it enabled once. For Debian/Ubuntu guests:
+>
+> ```bash
+> spinoza ssh
+> sudo sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0"/' /etc/default/grub
+> sudo update-grub
+> exit
+> spinoza halt && spinoza up
+> ```
+>
+> From then on, kernel and init output streams live into `spinoza logs` and into the `spinoza up` boot view.
 
 ## libvirt XML API
 
@@ -147,7 +263,7 @@ var domain = LibvirtDomain(
     targetPort: "0"
   )],
   qemuArgs: @[
-    "-netdev", "user,id=hostnet0,hostfwd=tcp::2222-:22",
+    "-netdev", "user,id=hostnet0",
     "-device", "virtio-net-pci,netdev=hostnet0"
   ]
 )
@@ -155,7 +271,7 @@ var domain = LibvirtDomain(
 echo toXML(domain)
 ```
 
-With shared folders (virtiofs):
+With shared folders (virtiofs on Linux):
 
 ```nim
 domain.memoryBacking = LibvirtMemoryBacking(
@@ -176,7 +292,6 @@ domain.filesystems.add LibvirtFilesystem(
 
 - [ ] Auto-detection of KVM/TCG acceleration
 - [ ] Snapshot and restore support
-- [ ] Port forwarding configuration in Spinozafile
 - [ ] Provisioning scripts (shell, Ansible)
 - [ ] Multi-VM environments (linked VMs)
 - [ ] Custom box creation from existing VMs
@@ -194,7 +309,6 @@ spinoza CLI (kapsis)
     ├── store.nim     ── VM registry (boogie KV store)
     ├── init.nim      ── Interactive Spinozafile creation
     ├── vm.nim        ── Domain lifecycle (libvirt), TCG wrapper
-    ├── network.nim   ── NAT network management (libvirt)
     ├── ssh.nim       ── Interactive SSH sessions (libssh2)
     └── box.nim       ── Box image management (flysystem)
 ```
