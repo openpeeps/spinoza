@@ -122,7 +122,7 @@ proc vmnetWrapperPath(socketPath: string): string =
     discard execShellCmd("chmod +x " & wrapper)
     wrapper
   else:
-    raise newException(NotImplementedError,
+    raise newException(CatchableError,
       "vmnet networking is only available on macOS")
 
 proc freeTcpPort*(): int =
@@ -139,17 +139,48 @@ proc resolveBoxPath*(config: SpinozaConfig): string =
 
 proc isVmnetMode*(mode: string): bool = mode in ["shared", "host"]
 
+proc isBridgedMode*(mode: string): bool =
+  ## True for shared/host modes on any platform.
+  mode in ["shared", "host"]
+
+proc connectionUri(mode: string): string =
+  ## Bridged networking on Linux requires qemu:///system (root-privileged
+  ## bridge creation). user mode and all macOS modes use session.
+  when defined(linux):
+    if isBridgedMode(mode): "qemu:///system"
+    else: "qemu:///session"
+  else:
+    "qemu:///session"
+
+proc resolveConnUri(name: string): string =
+  ## Look up the stored net mode for `name` and return the right URI.
+  let stored = loadVm(name)
+  if stored.isSome:
+    connectionUri(stored.get().netMode)
+  else:
+    "qemu:///session"
+
 proc netdevArgs(mode: string, forwardedPort: int, mac: string): seq[string] =
   ## QEMU networking args for the requested mode.
-  if mode == "user":
-    @["-netdev", "user,id=hostnet0,hostfwd=tcp::" & $forwardedPort & "-:22",
-      "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"]
+  ## On Linux, shared/host modes use <interface> XML instead of -netdev,
+  ## so we return empty and let domainXml inject the interface element.
+  when defined(linux):
+    if mode == "user":
+      @["-netdev", "user,id=hostnet0,hostfwd=tcp::" & $forwardedPort & "-:22",
+        "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"]
+    else:
+      # Bridged via <interface type='network'> — no -netdev needed
+      @[]
   else:
-    var dev = "virtio-net-pci,netdev=hostnet0,addr=0x7"
-    if mac.len > 0:
-      dev.add ",mac=" & mac
-    # fd 3 is handed over by socket_vmnet_client (see qemu-vmnet.sh wrapper)
-    @["-netdev", "socket,id=hostnet0,fd=3", "-device", dev]
+    if mode == "user":
+      @["-netdev", "user,id=hostnet0,hostfwd=tcp::" & $forwardedPort & "-:22",
+        "-device", "virtio-net-pci,netdev=hostnet0,addr=0x7"]
+    else:
+      var dev = "virtio-net-pci,netdev=hostnet0,addr=0x7"
+      if mac.len > 0:
+        dev.add ",mac=" & mac
+      # fd 3 is handed over by socket_vmnet_client (see qemu-vmnet.sh wrapper)
+      @["-netdev", "socket,id=hostnet0,fd=3", "-device", dev]
 
 proc domainXml*(config: SpinozaConfig, boxPath: string,
                 vmUuid: string, forwardedPort: int): string =
@@ -169,8 +200,12 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
-    emulator: if isVmnetMode(mode): vmnetWrapperPath(config.network.resolveSocketPath())
-              else: wrapperPath(),
+    emulator:
+      when defined(macosx):
+        if isVmnetMode(mode): vmnetWrapperPath(config.network.resolveSocketPath())
+        else: wrapperPath()
+      else:
+        wrapperPath(),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
@@ -186,6 +221,15 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
     )],
     qemuArgs: netdevArgs(mode, forwardedPort, mac)
   )
+  when defined(linux):
+    if isBridgedMode(mode):
+      let subnet = mode.getNetworkSubnet()
+      d.interfaces = @[LibvirtInterface(
+        ifaceType: "network",
+        sourceNetwork: networkName(subnet),
+        mac: mac,
+        model: "virtio"
+      )]
   when defined(macosx):
     if config.shared_folders.len > 0:
       for i, f in config.shared_folders:
@@ -277,19 +321,25 @@ proc discoverEndpoint(spinny: var Spinny, mode, name,
   return ("127.0.0.1", 22)
 
 proc up*(config: SpinozaConfig, provision = false) =
-  let conn = openConnect("qemu:///session")
+  let mode = config.network.netMode()
+  let conn = openConnect(connectionUri(mode))
   defer: conn.close
 
   let bpath = resolveBoxPath(config)
   if not fileExists(bpath):
     raise newException(IOError, "Box image not found: " & bpath)
 
-  let mode = config.network.netMode()
   let uuid =
     block:
       let existing = loadVm(config.name)
       if existing.isSome: existing.get().uuid else: newVmUuid()
   let hostPort = if isVmnetMode(mode): 0 else: freeTcpPort()
+
+  when defined(linux):
+    if isBridgedMode(mode):
+      let subnet = mode.getNetworkSubnet()
+      let fwdMode = if mode == "shared": "nat" else: ""
+      discard conn.ensureNetwork(subnet, fwdMode)
 
   cleanup(conn, config.name)
   let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
@@ -341,7 +391,7 @@ proc up*(config: SpinozaConfig, provision = false) =
     spinny.error("Timed out waiting for " & config.name & " to start")
 
 proc halt*(config: SpinozaConfig, force: bool = false) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   try:
@@ -355,13 +405,13 @@ proc halt*(config: SpinozaConfig, force: bool = false) =
     discard
 
 proc destroy*(config: SpinozaConfig) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   cleanup(conn, config.name)
 
 proc status*(config: SpinozaConfig) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   try:
@@ -373,6 +423,7 @@ proc status*(config: SpinozaConfig) =
 
 proc domainXmlFromState*(state: VmState, boxPath: string): string =
   let mem = $(state.memory * 1024)
+  let mac = deriveMac(state.uuid)
   var d = LibvirtDomain(
     virtType: "qemu",
     metadata: LibvirtMetadata(name: state.name),
@@ -386,8 +437,12 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
-    emulator: if isVmnetMode(state.netMode): vmnetWrapperPath(state.netMode.defaultSocketPath())
-              else: wrapperPath(),
+    emulator:
+      when defined(macosx):
+        if isVmnetMode(state.netMode): vmnetWrapperPath(state.netMode.defaultSocketPath())
+        else: wrapperPath()
+      else:
+        wrapperPath(),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
@@ -401,8 +456,17 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
       channelType: "unix", sourceMode: "bind",
       targetType: "virtio", targetName: "org.qemu.guest_agent.0"
     )],
-    qemuArgs: netdevArgs(state.netMode, state.sshPort, deriveMac(state.uuid))
+    qemuArgs: netdevArgs(state.netMode, state.sshPort, mac)
   )
+  when defined(linux):
+    if isBridgedMode(state.netMode):
+      let subnet = state.netMode.getNetworkSubnet()
+      d.interfaces = @[LibvirtInterface(
+        ifaceType: "network",
+        sourceNetwork: networkName(subnet),
+        mac: mac,
+        model: "virtio"
+      )]
   when defined(macosx):
     if state.sharedFolders.len > 0:
       for i, f in state.sharedFolders:
@@ -426,12 +490,18 @@ proc resolveBoxPathFromState*(state: VmState): string =
   disk.root / boxPath(state.box)
 
 proc upFromStore*(state: VmState) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
   let bpath = resolveBoxPathFromState(state)
   if not fileExists(bpath):
     raise newException(IOError, "Box image not found: " & bpath)
+
+  when defined(linux):
+    if isBridgedMode(state.netMode):
+      let subnet = state.netMode.getNetworkSubnet()
+      let fwdMode = if state.netMode == "shared": "nat" else: ""
+      discard conn.ensureNetwork(subnet, fwdMode)
 
   cleanup(conn, state.name)
   let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
@@ -462,7 +532,7 @@ proc upFromStore*(state: VmState) =
     spinny.error("Timed out waiting for " & state.name & " to start")
 
 proc haltFromStore*(state: VmState, force: bool = false) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
   try:
@@ -476,7 +546,7 @@ proc haltFromStore*(state: VmState, force: bool = false) =
     discard
 
 proc reload*(config: SpinozaConfig, provision = false) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   var spinny = newSpinny("Reloading " & config.name & "...", "dots", time = true)
@@ -520,6 +590,12 @@ proc reload*(config: SpinozaConfig, provision = false) =
       let existing = loadVm(config.name)
       if existing.isSome: existing.get().uuid else: newVmUuid()
   let hostPort = if isVmnetMode(mode): 0 else: freeTcpPort()
+
+  when defined(linux):
+    if isBridgedMode(mode):
+      let subnet = mode.getNetworkSubnet()
+      let fwdMode = if mode == "shared": "nat" else: ""
+      discard conn.ensureNetwork(subnet, fwdMode)
 
   let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
   dom.create
@@ -567,7 +643,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
     spinny.error("Timed out waiting for " & config.name & " to restart")
 
 proc reloadFromStore*(state: VmState) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
   var spinny = newSpinny("Reloading " & state.name & "...", "dots", time = true)
@@ -605,6 +681,12 @@ proc reloadFromStore*(state: VmState) =
     spinny.error("Box image not found: " & bpath)
     return
 
+  when defined(linux):
+    if isBridgedMode(state.netMode):
+      let subnet = state.netMode.getNetworkSubnet()
+      let fwdMode = if state.netMode == "shared": "nat" else: ""
+      discard conn.ensureNetwork(subnet, fwdMode)
+
   let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
   dom.create
   updateStatus(state.name, "running")
@@ -628,7 +710,7 @@ proc reloadFromStore*(state: VmState) =
     spinny.error("Timed out waiting for " & state.name & " to restart")
 
 proc suspend*(config: SpinozaConfig) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   try:
@@ -643,7 +725,7 @@ proc suspend*(config: SpinozaConfig) =
     displayError("Failed to suspend " & config.name)
 
 proc suspendFromStore*(state: VmState) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
   try:
@@ -658,7 +740,7 @@ proc suspendFromStore*(state: VmState) =
     displayError("Failed to suspend " & state.name)
 
 proc resume*(config: SpinozaConfig) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
   try:
@@ -674,7 +756,7 @@ proc resume*(config: SpinozaConfig) =
     displayError("Failed to resume " & config.name)
 
 proc resumeFromStore*(state: VmState) =
-  let conn = openConnect("qemu:///session")
+  let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
   try:

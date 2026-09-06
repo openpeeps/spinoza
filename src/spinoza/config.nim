@@ -80,10 +80,12 @@ proc getHostRamMB*(): int =
     let output = execProcess("sysctl -n hw.memsize")
     result = parseInt(output.strip()) div (1024 * 1024)
   elif defined(linux):
-    for line in lines("/proc/meminfo"):
+    let meminfo = readFile("/proc/meminfo")
+    for line in meminfo.splitLines():
       if line.startsWith("MemTotal:"):
-        let parts = line.split()
-        result = parseInt(parts[1]) div 1024
+        let parts = line.splitWhitespace()
+        if parts.len >= 2:
+          result = parseInt(parts[1]) div 1024
         break
   else:
     result = 0
