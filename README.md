@@ -64,11 +64,10 @@ sudo usermod -aG libvirt $(whoami)
 # supplementary group is visible in `id`. `groups` alone is not enough —
 # `id` must show `libvirt` before spinoza `shared`/`host` will work.
 
-# Bridged modes (shared/host) run QEMU as libvirt-qemu (qemu:///system),
-# so the image path must be traversable. With the default layout:
-chmod 755 $HOME                          # allow libvirt-qemu to traverse $HOME (~ is often 750)
-chmod 644 ~/.spinoza/boxes/*.img         # allow world-readable box images
-# Alternatively use a system pool: /var/lib/libvirt/images
+# Bridged modes (shared/host) run via `qemu:///system`. Spinoza injects
+# `<seclabel type='dynamic' model='dac' relabel='yes'>` with `+uid:+gid`
+# so QEMU runs as your user and `~/.spinoza/boxes/*.img` is auto-relabeled
+# — no manual `chmod` needed. System pool `/var/lib/libvirt/images` also works.
 ```
 
 > [!NOTE]
@@ -285,7 +284,7 @@ On Linux, `shared` and `host` are implemented natively via libvirt virtual netwo
 
 Both modes use `qemu:///system` (system libvirtd) and are discovered via `ip neigh` matched against the deterministic MAC `52:54:00:xx:yy:zz` derived from the VM UUID. A single shared bridge is reused for all VMs of the same mode (verified: `spz-shared` / `spz-host`, `virsh -c qemu:///system net-list`).
 
-**One-time setup** is the prerequisites above (group + `chmod 755 $HOME`). Verify with:
+**One-time setup** is the prerequisites above (group + relogin — no `chmod` needed, DAC seclabel handles it). Verify with:
 ```bash
 id | grep -q libvirt || echo "re-login needed"
 virsh -c qemu:///system net-list --all   # should list spinoza-192.168.124 when active
@@ -297,7 +296,7 @@ ip neigh | grep 192.168.124
 **Troubleshooting:**
 
 - `Failed to connect socket to '/var/run/libvirt/libvirt-sock': Permission denied` — `id` doesn't show `libvirt` after `usermod`; do a full logout (or `loginctl terminate-user $USER` / reboot) or create the polkit rule above. `sg`/`newgrp` are not installed in this base image.
-- `Cannot access storage file '.../boxes/*.img' (as uid:64055, gid:991): Permission denied` — `qemu:///system` runs as `libvirt-qemu`, not you. Fix with `chmod 755 $HOME && chmod 644 ~/.spinoza/boxes/*.img`.
+- `Cannot access storage file '.../boxes/*.img' (as uid:64055, gid:991): Permission denied` — seclabel not applied (old libvirt or `qemu:///session` misconfig). Spinoza on Linux `shared`/`host` injects DAC `seclabel +uid:+gid` so QEMU runs as you and the image is relabeled. Fallback: `chmod 711 $HOME && chmod 644 ~/.spinoza/boxes/*.img` or move image to `/var/lib/libvirt/images`.
 - `error creating bridge interface ...: Numerical result out of range` — bridge names are capped at 15 chars (`IFNAMSIZ`); Spinoza uses `spz-shared` / `spz-host`.
 - Guest never gets an IP — ensure `dnsmasq-base` is installed, the default libvirt network `default` is not conflicting on `192.168.124.0/24`, and `spz-shared` exists. Check `journalctl -u libvirtd` and `virsh -c qemu:///system net-dumpxml spinoza-192.168.124`.
 
