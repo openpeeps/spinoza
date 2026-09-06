@@ -182,6 +182,11 @@ proc netdevArgs(mode: string, forwardedPort: int, mac: string): seq[string] =
       # fd 3 is handed over by socket_vmnet_client (see qemu-vmnet.sh wrapper)
       @["-netdev", "socket,id=hostnet0,fd=3", "-device", dev]
 
+proc ensureLogFile(path: string) =
+  ## Ensure log file exists as user-owned (for PTY console where QEMU doesn't create a file).
+  if not fileExists(path):
+    try: writeFile(path, "") except: discard
+
 proc domainXml*(config: SpinozaConfig, boxPath: string,
                 vmUuid: string, forwardedPort: int): string =
   let mem = $(config.memory * 1024)
@@ -221,6 +226,15 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
     )],
     qemuArgs: netdevArgs(mode, forwardedPort, mac)
   )
+  when defined(linux):
+    if isBridgedMode(mode) and connectionUri(mode) == "qemu:///system":
+      let uid = getuid()
+      let gid = getgid()
+      d.seclabel = LibvirtSeclabel(
+        seclabelType: "dynamic", model: "dac", relabel: "yes",
+        label: "+" & $uid & ":+" & $gid,
+        imagelabel: "+" & $uid & ":+" & $gid
+      )
   when defined(linux):
     if isBridgedMode(mode):
       let subnet = mode.getNetworkSubnet()
@@ -344,6 +358,9 @@ proc up*(config: SpinozaConfig, provision = false) =
   cleanup(conn, config.name)
   let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
   dom.create
+  when defined(linux):
+    if isBridgedMode(mode) and connectionUri(mode) == "qemu:///system":
+      ensureLogFile(vmLogPath(config.name))
 
   let (sshHost, sshPort) = resolveEndpoint(mode, config.name, uuid, hostPort)
   var state = VmState(
@@ -467,6 +484,14 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
         mac: mac,
         model: "virtio"
       )]
+    if isBridgedMode(state.netMode) and connectionUri(state.netMode) == "qemu:///system":
+      let uid = getuid()
+      let gid = getgid()
+      d.seclabel = LibvirtSeclabel(
+        seclabelType: "dynamic", model: "dac", relabel: "yes",
+        label: "+" & $uid & ":+" & $gid,
+        imagelabel: "+" & $uid & ":+" & $gid
+      )
   when defined(macosx):
     if state.sharedFolders.len > 0:
       for i, f in state.sharedFolders:
@@ -506,6 +531,10 @@ proc upFromStore*(state: VmState) =
   cleanup(conn, state.name)
   let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
   dom.create
+  when defined(linux):
+    if isBridgedMode(state.netMode) and connectionUri(state.netMode) == "qemu:///system":
+      try: writeFile(vmLogPath(state.name), "") except: discard
+      ensureLogFile(vmLogPath(state.name))
   updateStatus(state.name, "running")
 
   var spinny = newSpinny("Spinning up " & state.name & "...", "dots", time = true)
@@ -599,6 +628,10 @@ proc reload*(config: SpinozaConfig, provision = false) =
 
   let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
   dom.create
+  when defined(linux):
+    if isBridgedMode(mode) and connectionUri(mode) == "qemu:///system":
+      try: writeFile(vmLogPath(config.name), "") except: discard
+      ensureLogFile(vmLogPath(config.name))
 
   let (sshHost, sshPort) = resolveEndpoint(mode, config.name, uuid, hostPort)
   block persistState:
@@ -689,6 +722,10 @@ proc reloadFromStore*(state: VmState) =
 
   let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
   dom.create
+  when defined(linux):
+    if isBridgedMode(state.netMode) and connectionUri(state.netMode) == "qemu:///system":
+      try: writeFile(vmLogPath(state.name), "") except: discard
+      ensureLogFile(vmLogPath(state.name))
   updateStatus(state.name, "running")
 
   var (host, port) = (state.sshHost, state.sshPort)

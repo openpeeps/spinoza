@@ -1,0 +1,22 @@
+# Spinoza example — debian12 with virtiofs shared folder + bridged networking
+# Usage:
+#   cd examples
+#   spinoza up              # boots 192.168.124.x on spz-shared (Linux) / vmnet (macOS)
+#   spinoza ssh             # 192.168.124.x via libvirt, no port-forward
+#   # inside guest:
+#   sudo mkdir -p /mnt/project && sudo mount -t virtiofs project /mnt/project
+#   ls /mnt/project         # shows ./project/hello.txt from host
+#   # host → guest is live: edit host file, cat in guest instantly
+
+box: debian12
+name: spinoza-example
+memory: 2048
+cpus: 2
+network:
+  mode: shared
+ssh_config:
+  user: vagrant
+  password: vagrant
+shared_folders:
+  - host: "./project"
+    tag: "project"

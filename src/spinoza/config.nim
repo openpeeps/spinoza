@@ -112,12 +112,12 @@ proc resolveSocketPath*(n: NetworkConfig): string =
   n.netMode().defaultSocketPath()
 
 proc validateConfig*(config: SpinozaConfig) =
-  ## Validate memory requirements against host RAM.
+  ## Validate memory against host RAM (no lower bound — user decides).
   let hostRam = getHostRamMB()
 
-  if config.memory < 1024:
+  if config.memory <= 0:
     raise newException(ValueError,
-      "Memory must be at least 1024 MB (1 GB). Got: " & $config.memory & " MB")
+      "Memory must be a positive integer (MB). Got: " & $config.memory & " MB")
 
   if hostRam > 0 and config.memory > hostRam:
     raise newException(ValueError,
@@ -138,11 +138,23 @@ proc validateConfig*(config: SpinozaConfig) =
 
 proc loadConfig*(path: string): SpinozaConfig =
   var config = parseYAML(readFile(path), SpinozaConfig)
-  # Resolve provision script paths relative to the Spinozafile directory
+  # Resolve relative paths against the Spinozafile directory
   let baseDir = parentDir(absolutePath(path))
   for i, s in mpairs(config.provision_script):
     if not isAbsolute(s):
       config.provision_script[i] = joinPath(baseDir, s)
+  for i, f in mpairs(config.shared_folders):
+    if not isAbsolute(f.host):
+      var h = f.host
+      if h.startsWith("~/"):
+        h = getHomeDir() / h[2 .. ^1]
+      else:
+        if h.startsWith("./"):
+          h = h[2 .. ^1]
+        h = joinPath(baseDir, h)
+      # Normalize ./ and // components
+      h = absolutePath(h)
+      config.shared_folders[i].host = h
   config
 
 proc findAndLoadConfig*(dir: string = getCurrentDir()): SpinozaConfig =

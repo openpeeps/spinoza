@@ -1,0 +1,2 @@
+Hello from the host! If you see this inside the VM at /mnt/project/hello.txt, virtiofs is working.
+Try: echo "edited on host" >> hello.txt && spinoza ssh -- cat /mnt/project/hello.txt

@@ -12,10 +12,14 @@ proc pumpLog*(path: string, f: var File, pos: var int): string =
   ## Incrementally return bytes appended to `path` since the previous call.
   ## Lazily opens the file (starting at its current end); returns "" when
   ## nothing new. Survives truncation/recreation between boots.
+  ## For qemu:///system PTY consoles, the file is user-owned via stream thread (Option A).
   if f.isNil:
     if not fileExists(path):
       return ""
-    f = open(path, fmRead)
+    try:
+      f = open(path, fmRead)
+    except IOError:
+      return ""
     pos = f.getFileSize()
     return ""
   let size = f.getFileSize()

@@ -45,8 +45,8 @@ proc initCommand*(v: Values) =
 
   # Validate memory before proceeding
   let memVal = parseInt(memory)
-  if memVal < 1024:
-    displayError("Memory must be at least 1024 MB (1 GB). Got: " & memory & " MB")
+  if memVal <= 0:
+    displayError("Memory must be a positive integer (MB). Got: " & memory & " MB")
     return
   let hostRam = getHostRamMB()
   if hostRam > 0 and memVal > hostRam:
