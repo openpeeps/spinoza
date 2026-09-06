@@ -53,3 +53,25 @@ proc logsDir*(): string =
 
 proc vmLogPath*(name: string): string =
   logsDir() / (name & ".log")
+
+proc vmDiskPath*(name, boxName: string): string =
+  ## Per-VM overlay disk image path.
+  let base = getHomeDir() / spinozaDirName / vmsDirName
+  createDir(base)
+  base / (name & "-" & boxName & ".qcow2")
+
+proc ensureOverlay*(name, boxName: string): string =
+  ## Create a standalone qcow2 disk for `name` from the base box image.
+  ## Returns the disk path. If it already exists, returns it.
+  let overlay = vmDiskPath(name, boxName)
+  if not fileExists(overlay):
+    let base = fs.rawDisk("boxes").root / boxPath(boxName)
+    if not fileExists(base):
+      raise newException(IOError, "Box image not found: " & base)
+    # Create a standalone qcow2 to avoid AppArmor issues with
+    # qcow2 backing-file chains on per-domain profiles.
+    discard execShellCmd("qemu-img convert -f qcow2 -O qcow2 " &
+      quoteShell(base) & " " & quoteShell(overlay))
+    if not fileExists(overlay):
+      raise newException(IOError, "Failed to create disk: " & overlay)
+  overlay

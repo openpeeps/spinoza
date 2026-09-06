@@ -98,6 +98,25 @@ proc pathPresent(p: string): bool =
   var s: Stat
   result = stat(p.cstring, s) == 0
 
+proc hostSupportsKvm*(): bool =
+  ## Auto-detect KVM: /dev/kvm exists and host advertises kvm.
+  when defined(linux):
+    if not pathPresent("/dev/kvm"):
+      return false
+    when defined(posix):
+      if access("/dev/kvm", R_OK or W_OK) == 0:
+        return true
+      if fileExists("/proc/modules"):
+        try:
+          if "kvm" in readFile("/proc/modules"):
+            return true
+        except: discard
+      return false
+    else:
+      return pathPresent("/dev/kvm")
+  else:
+    return false
+
 proc vmnetWrapperPath(socketPath: string): string =
   ## Emulator shim routing QEMU through socket_vmnet_client for vmnet modes.
   when defined(macosx):
@@ -192,8 +211,9 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
   let mem = $(config.memory * 1024)
   let mode = config.network.netMode()
   let mac = deriveMac(vmUuid)
+  let useKvm = hostSupportsKvm()
   var d = LibvirtDomain(
-    virtType: "qemu",
+    virtType: if useKvm: "kvm" else: "qemu",
     metadata: LibvirtMetadata(name: config.name),
     memory: LibvirtMemory(value: mem, unit: "KiB"),
     currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
@@ -231,9 +251,9 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
       let uid = getuid()
       let gid = getgid()
       d.seclabel = LibvirtSeclabel(
-        seclabelType: "dynamic", model: "dac", relabel: "yes",
-        label: "+" & $uid & ":+" & $gid,
-        imagelabel: "+" & $uid & ":+" & $gid
+        seclabelType: "static", model: "dac", relabel: "no",
+        label: $uid & ":" & $gid,
+        imagelabel: $uid & ":" & $gid
       )
   when defined(linux):
     if isBridgedMode(mode):
@@ -339,9 +359,7 @@ proc up*(config: SpinozaConfig, provision = false) =
   let conn = openConnect(connectionUri(mode))
   defer: conn.close
 
-  let bpath = resolveBoxPath(config)
-  if not fileExists(bpath):
-    raise newException(IOError, "Box image not found: " & bpath)
+  let bpath = ensureOverlay(config.name, config.box)
 
   let uuid =
     block:
@@ -441,8 +459,9 @@ proc status*(config: SpinozaConfig) =
 proc domainXmlFromState*(state: VmState, boxPath: string): string =
   let mem = $(state.memory * 1024)
   let mac = deriveMac(state.uuid)
+  let useKvm = hostSupportsKvm()
   var d = LibvirtDomain(
-    virtType: "qemu",
+    virtType: if useKvm: "kvm" else: "qemu",
     metadata: LibvirtMetadata(name: state.name),
     memory: LibvirtMemory(value: mem, unit: "KiB"),
     currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
@@ -488,9 +507,9 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
       let uid = getuid()
       let gid = getgid()
       d.seclabel = LibvirtSeclabel(
-        seclabelType: "dynamic", model: "dac", relabel: "yes",
-        label: "+" & $uid & ":+" & $gid,
-        imagelabel: "+" & $uid & ":+" & $gid
+        seclabelType: "static", model: "dac", relabel: "no",
+        label: $uid & ":" & $gid,
+        imagelabel: $uid & ":" & $gid
       )
   when defined(macosx):
     if state.sharedFolders.len > 0:
@@ -518,9 +537,7 @@ proc upFromStore*(state: VmState) =
   let conn = openConnect(connectionUri(state.netMode))
   defer: conn.close
 
-  let bpath = resolveBoxPathFromState(state)
-  if not fileExists(bpath):
-    raise newException(IOError, "Box image not found: " & bpath)
+  let bpath = ensureOverlay(state.name, state.box)
 
   when defined(linux):
     if isBridgedMode(state.netMode):
@@ -608,10 +625,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
   except LibvirtError:
     discard
 
-  let bpath = resolveBoxPath(config)
-  if not fileExists(bpath):
-    spinny.error("Box image not found: " & bpath)
-    return
+  let bpath = ensureOverlay(config.name, config.box)
 
   let mode = config.network.netMode()
   let uuid =
@@ -709,10 +723,7 @@ proc reloadFromStore*(state: VmState) =
   except LibvirtError:
     discard
 
-  let bpath = resolveBoxPathFromState(state)
-  if not fileExists(bpath):
-    spinny.error("Box image not found: " & bpath)
-    return
+  let bpath = ensureOverlay(state.name, state.box)
 
   when defined(linux):
     if isBridgedMode(state.netMode):
