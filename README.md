@@ -130,17 +130,7 @@ spinoza up
 spinoza ssh
 ```
 
-**5. Mount shared folders (inside guest)**
-
-```bash
-# If shared_folders are configured in Spinozafile:
-# Linux (virtiofs):
-sudo mount -t virtiofs <tag> /mnt/<tag>
-# macOS (9p):
-sudo mount -t 9p -o trans=virtio <tag> /mnt/<tag>
-```
-
-**6. Shut down**
+**5. Shut down**
 
 ```bash
 spinoza halt
