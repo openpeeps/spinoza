@@ -17,6 +17,7 @@ type
     uuid*: string
     box*: string
     name*: string
+    driver*: string         ## "qemu" (default) | "lxc"
     memory*: int
     cpus*: int
     netMode*: string
@@ -26,6 +27,9 @@ type
     sshPass*: string
     sharedFolders*: seq[SharedFolder]
     status*: string
+
+proc isContainer*(s: VmState): bool =
+  s.driver == "lxc"
 
 var store*: KvStore
 
@@ -55,6 +59,7 @@ proc saveVm*(state: VmState) =
     "uuid": state.uuid,
     "box": state.box,
     "name": state.name,
+    "driver": state.driver,
     "memory": state.memory,
     "cpus": state.cpus,
     "net_mode": state.netMode,
@@ -82,6 +87,7 @@ proc loadVm*(name: string): Option[VmState] =
     uuid: node["uuid"].getStr,
     box: node["box"].getStr,
     name: node["name"].getStr,
+    driver: node{"driver"}.getStr("qemu"),
     memory: node["memory"].getInt.int,
     cpus: node["cpus"].getInt.int,
     netMode: node{"net_mode"}.getStr("user"),
@@ -110,6 +116,7 @@ proc listVms*(): seq[VmState] =
         uuid: node["uuid"].getStr,
         box: node["box"].getStr,
         name: node["name"].getStr,
+        driver: node{"driver"}.getStr("qemu"),
         memory: node["memory"].getInt.int,
         cpus: node["cpus"].getInt.int,
         netMode: node{"net_mode"}.getStr("user"),
