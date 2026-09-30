@@ -111,7 +111,34 @@ QEMU is bundled with Spinoza on macOS via a TCG wrapper when KVM is unavailable.
 spinoza init
 ```
 
-This will interactively prompt for box name, VM name, memory, CPUs, SSH settings, and optional shared folders.
+Interactive mode opens with a dropdown of your installed boxes (`spinoza box.list`),
+then prompts for VM name, memory, CPUs, network mode, SSH settings, and optional
+shared folders. Container boxes are marked `(container)` and default to `shared`
+networking.
+
+Pass any value flag to skip the prompts entirely — useful for scripts:
+
+```bash
+# box is positional, everything else is a flag (note the `=`)
+spinoza init debian12 --name=web --memory=4096 --cpus=4 --network=shared \
+  --ssh-user=vagrant --ssh-password=vagrant
+
+# container from a rootfs box, two shared folders, overwrite existing file
+spinoza init debian12-lxc --name=web --type=container \
+  --shared-folder="$PWD/code:code,/home/me/data:data" --force
+```
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `<box>` (positional) | first installed box | Warns if the box isn't installed yet |
+| `--name` | `my-vm` | VM/container name |
+| `--memory` | `2048` | MB; validated against host RAM |
+| `--cpus` | `2` | |
+| `--network` | `user` (`shared` for containers) | `user`, `shared`, `host` |
+| `--ssh-user` / `--ssh-password` | `vagrant` | |
+| `--type` | inferred from the box | `vm`/`qemu` or `container`/`lxc` |
+| `--shared-folder` | – | `host/path,tag`, comma separated for several |
+| `--force` | – | Overwrite an existing Spinozafile |
 
 **2. Add a box image**
 

@@ -5,11 +5,19 @@
 #          Made by Humans from OpenPeeps
 #          https://github.com/openpeeps/spinoza
 
-import std/[httpclient, os, strutils]
+import std/[algorithm, httpclient, os, strutils]
 import pkg/kapsis/interactive/prompts
 import flysystem
 
 import ./paths
+
+type
+  BoxKind* = enum
+    bkQemu, bkContainer
+
+  BoxInfo* = object
+    name*: string
+    kind*: BoxKind
 
 proc isLocalPath*(input: string): bool =
   input.startsWith("/") or input.startsWith("./") or
@@ -49,13 +57,27 @@ proc removeBox*(name: string) =
   disk.delete(path)
   displaySuccess("Removed box: " & name)
 
-proc listBoxes*() =
+proc availableBoxes*(): seq[BoxInfo] =
+  ## Installed boxes, sorted by name. QEMU boxes are `*.img` images,
+  ## container boxes are directories holding a `rootfs/`.
   let disk = fs.disk("boxes")
-  let entries = disk.list(".")
-  var found = false
-  for entry in entries:
-    if entry.path.endsWith(".img") and not entry.isDir:
-      echo entry.path.splitFile().name
-      found = true
-  if not found:
+  for entry in disk.list("."):
+    let name = entry.path.splitFile().name
+    if entry.isDir:
+      when defined(linux):
+        if disk.exists(containerBaseRootfs(name)):
+          result.add BoxInfo(name: name, kind: bkContainer)
+    elif entry.path.endsWith(".img"):
+      result.add BoxInfo(name: name, kind: bkQemu)
+  result.sort(proc (a, b: BoxInfo): int = cmp(a.name, b.name))
+
+proc listBoxes*() =
+  let boxes = availableBoxes()
+  if boxes.len == 0:
     displayInfo("No boxes installed")
+    return
+  for box in boxes:
+    let kind = case box.kind
+      of bkQemu: ""
+      of bkContainer: " (container)"
+    echo box.name & kind
