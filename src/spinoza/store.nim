@@ -27,7 +27,11 @@ type
     sharedFolders*: seq[SharedFolder]
     status*: string
 
-var store*: KvStore
+var store* {.threadvar.}: KvStore
+  ## Thread-local so the desktop app can run VM actions on a worker
+  ## thread with its own handle (single-threaded CLI use is unaffected).
+  ## The desktop main thread and its worker never hold the DB open
+  ## at the same time (guarded by `busy` + close/reopen around actions).
 
 proc openStore*() =
   let dbPath = vmDbPath()

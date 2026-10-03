@@ -17,7 +17,9 @@ const
   defaultConfigName* = "Spinozafile"
 
 var
-  fs*: Filesystem
+  fs* {.threadvar.}: Filesystem
+    ## Thread-local so the desktop app can run VM actions on a worker
+    ## thread with its own handle (single-threaded CLI use is unaffected).
 
 proc initFs*() =
   let base = getHomeDir() / spinozaDirName
