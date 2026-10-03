@@ -189,8 +189,21 @@ when isMainModule:
   initKapsis do:
     commands:
       -- "Setup"
-      init:
+      init ?string(boxName),
+        ?string("--name"),
+        ?string("--memory"),
+        ?string("--cpus"),
+        ?string("--network"),
+        ?string("--ssh-user"),
+        ?string("--ssh-password"),
+        ?string("--type"),
+        ?string("--shared-folder"),
+        ?bool("--force"):
         ## Create a Spinozafile in the current directory
+        ## With no arguments, prompts interactively (box picker, network, SSH)
+        ## Any value flag skips all prompts, e.g.
+        ## spinoza init debian12 --name=web --memory=4096 --cpus=4 --network=shared
+        ## --shared-folder takes host/path,tag (comma separated for several)
 
       -- "Virtual Machines"
       up ?string(vmName), ?bool("--provision"):

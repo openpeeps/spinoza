@@ -77,3 +77,30 @@ proc ensureOverlay*(name, boxName: string): string =
     if not fileExists(overlay):
       raise newException(IOError, "Failed to create disk: " & overlay)
   overlay
+
+when defined(linux):
+  proc containerBaseRootfs*(boxName: string): string =
+    ## Base container rootfs for `boxName`: ~/.spinoza/boxes/<box>/rootfs.
+    ## Prepared once per box (debootstrap / tarball extract, see README).
+    fs.rawDisk("boxes").root / boxName / "rootfs"
+
+  proc containerRootfsPath*(name, boxName: string): string =
+    ## Per-container writable rootfs path.
+    let base = getHomeDir() / spinozaDirName / vmsDirName
+    createDir(base)
+    base / (name & "-" & boxName & "-rootfs")
+
+  proc ensureContainerRoot*(name, boxName: string): string =
+    ## Copy the base rootfs to a per-container writable rootfs.
+    ## Returns the rootfs path. If it already exists, returns it.
+    let dest = containerRootfsPath(name, boxName)
+    if not dirExists(dest):
+      let base = containerBaseRootfs(boxName)
+      if not dirExists(base):
+        raise newException(IOError,
+          "Container rootfs not found: " & base & "\n" &
+          "Prepare it once per box (e.g. debootstrap or tarball extract).")
+      discard execShellCmd("cp -a " & quoteShell(base) & " " & quoteShell(dest))
+      if not dirExists(dest):
+        raise newException(IOError, "Failed to create container rootfs: " & dest)
+    dest

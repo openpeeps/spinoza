@@ -171,11 +171,27 @@ proc connectionUri(mode: string): string =
   else:
     "qemu:///session"
 
+when defined(linux):
+  proc lxcConnectionUri*(): string =
+    ## LXC containers always use the privileged system connection.
+    "lxc:///system"
+
+proc connectionUriFor*(driver, mode: string): string =
+  ## Driver-aware connection URI. Containers use lxc:///system (Linux-only).
+  when defined(linux):
+    if driver == "lxc":
+      return lxcConnectionUri()
+  connectionUri(mode)
+
 proc resolveConnUri(name: string): string =
-  ## Look up the stored net mode for `name` and return the right URI.
+  ## Look up the stored VM and return the right URI for its driver/net mode.
   let stored = loadVm(name)
   if stored.isSome:
-    connectionUri(stored.get().netMode)
+    let s = stored.get()
+    when defined(linux):
+      if s.isContainer:
+        return lxcConnectionUri()
+    connectionUri(s.netMode)
   else:
     "qemu:///session"
 
@@ -282,6 +298,57 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
           sourceDir: f.host, targetDir: f.tag)
   toXML(d)
 
+when defined(linux):
+  const lxcInit* = "/sbin/init"
+
+  proc lxcFilesystems(rootfs: string,
+                      folders: seq[SharedFolder]): seq[LibvirtFilesystem] =
+    ## Rootfs mount plus one bind-mount per shared folder (<tag> → /mnt/<tag>).
+    result = @[LibvirtFilesystem(
+      fsType: "mount", sourceDir: rootfs, targetDir: "/"
+    )]
+    for f in folders:
+      result.add LibvirtFilesystem(
+        fsType: "mount", sourceDir: f.host, targetDir: "/mnt/" & f.tag)
+
+  proc lxcDomainXml*(name, rootfs, vmUuid: string, memory, cpus: int,
+                     mode: string,
+                     folders: seq[SharedFolder]): string =
+    ## Build a libvirt LXC container domain (no emulator, disk, or qemu args).
+    let mem = $(memory * 1024)
+    let mac = deriveMac(vmUuid)
+    let subnet = mode.getNetworkSubnet()
+    var d = LibvirtDomain(
+      virtType: "lxc",
+      metadata: LibvirtMetadata(name: name),
+      memory: LibvirtMemory(value: mem, unit: "KiB"),
+      currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
+      vcpu: LibvirtVcpu(value: $cpus, placement: "static"),
+      os: LibvirtOS(osType: "exe", arch: "x86_64", init: lxcInit),
+      clock: LibvirtClock(offset: "utc"),
+      events: LibvirtEvents(
+        onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
+      interfaces: @[LibvirtInterface(
+        ifaceType: "network",
+        sourceNetwork: networkName(subnet),
+        mac: mac
+      )],
+      consoles: @[LibvirtConsole(
+        sourceType: "pty", targetType: "lxc", targetPort: "0"
+      )],
+      filesystems: lxcFilesystems(rootfs, folders)
+    )
+    toXML(d)
+
+  proc lxcDomainXmlFromConfig*(config: SpinozaConfig, rootfs,
+                               vmUuid: string): string =
+    lxcDomainXml(config.name, rootfs, vmUuid, config.memory, config.cpus,
+                 config.network.netMode(), config.shared_folders)
+
+  proc lxcDomainXmlFromState*(state: VmState, rootfs: string): string =
+    lxcDomainXml(state.name, rootfs, state.uuid, state.memory, state.cpus,
+                 state.netMode, state.sharedFolders)
+
 proc cleanup*(conn: Connect, domainName: string) =
   try:
     let dom = conn.lookupDomainByName(domainName)
@@ -356,10 +423,12 @@ proc discoverEndpoint(spinny: var Spinny, mode, name,
 
 proc up*(config: SpinozaConfig, provision = false) =
   let mode = config.network.netMode()
-  let conn = openConnect(connectionUri(mode))
+  let isLxc =
+    when defined(linux): config.isContainer
+    else: false
+  let driver = if isLxc: "lxc" else: "qemu"
+  let conn = openConnect(connectionUriFor(driver, mode))
   defer: conn.close
-
-  let bpath = ensureOverlay(config.name, config.box)
 
   let uuid =
     block:
@@ -374,10 +443,22 @@ proc up*(config: SpinozaConfig, provision = false) =
       discard conn.ensureNetwork(subnet, fwdMode)
 
   cleanup(conn, config.name)
-  let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
+  let domainXmlStr =
+    when defined(linux):
+      if isLxc:
+        lxcDomainXmlFromConfig(config,
+          ensureContainerRoot(config.name, config.box), uuid)
+      else:
+        domainXml(config, ensureOverlay(config.name, config.box),
+          uuid, hostPort)
+    else:
+      domainXml(config, ensureOverlay(config.name, config.box),
+        uuid, hostPort)
+  let dom = conn.defineDomainXML(domainXmlStr)
   dom.create
   when defined(linux):
-    if isBridgedMode(mode) and connectionUri(mode) == "qemu:///system":
+    if isBridgedMode(mode) and not isLxc and
+        connectionUri(mode) == "qemu:///system":
       ensureLogFile(vmLogPath(config.name))
 
   let (sshHost, sshPort) = resolveEndpoint(mode, config.name, uuid, hostPort)
@@ -385,6 +466,7 @@ proc up*(config: SpinozaConfig, provision = false) =
     uuid: uuid,
     box: config.box,
     name: config.name,
+    driver: driver,
     memory: config.memory,
     cpus: config.cpus,
     netMode: mode,
@@ -413,8 +495,10 @@ proc up*(config: SpinozaConfig, provision = false) =
     config.ssh_config.user, config.ssh_config.password)
 
   if vmReady:
-    autoMountSharedFolders(host, port,
-      config.ssh_config.user, config.ssh_config.password, config.shared_folders)
+    if not isLxc:
+      # Containers already bind-mount shared folders via <filesystem>.
+      autoMountSharedFolders(host, port,
+        config.ssh_config.user, config.ssh_config.password, config.shared_folders)
     if provision:
       let ok = provisionModule.runProvisions(addr spinny, host, port,
         config.ssh_config.user, config.ssh_config.password,
@@ -534,10 +618,11 @@ proc resolveBoxPathFromState*(state: VmState): string =
   disk.root / boxPath(state.box)
 
 proc upFromStore*(state: VmState) =
-  let conn = openConnect(connectionUri(state.netMode))
+  let isLxc =
+    when defined(linux): state.isContainer
+    else: false
+  let conn = openConnect(connectionUriFor(state.driver, state.netMode))
   defer: conn.close
-
-  let bpath = ensureOverlay(state.name, state.box)
 
   when defined(linux):
     if isBridgedMode(state.netMode):
@@ -546,10 +631,20 @@ proc upFromStore*(state: VmState) =
       discard conn.ensureNetwork(subnet, fwdMode)
 
   cleanup(conn, state.name)
-  let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
+  let domainXmlStr =
+    when defined(linux):
+      if isLxc:
+        lxcDomainXmlFromState(state,
+          ensureContainerRoot(state.name, state.box))
+      else:
+        domainXmlFromState(state, ensureOverlay(state.name, state.box))
+    else:
+      domainXmlFromState(state, ensureOverlay(state.name, state.box))
+  let dom = conn.defineDomainXML(domainXmlStr)
   dom.create
   when defined(linux):
-    if isBridgedMode(state.netMode) and connectionUri(state.netMode) == "qemu:///system":
+    if isBridgedMode(state.netMode) and not isLxc and
+        connectionUri(state.netMode) == "qemu:///system":
       try: writeFile(vmLogPath(state.name), "") except: discard
       ensureLogFile(vmLogPath(state.name))
   updateStatus(state.name, "running")
@@ -571,14 +666,15 @@ proc upFromStore*(state: VmState) =
     state.sshUser, state.sshPass)
 
   if vmReady:
-    autoMountSharedFolders(host, port, state.sshUser, state.sshPass,
-      state.sharedFolders)
+    if not isLxc:
+      autoMountSharedFolders(host, port, state.sshUser, state.sshPass,
+        state.sharedFolders)
     spinny.success(state.name & " is ready on " & host & ":" & $port)
   else:
     spinny.error("Timed out waiting for " & state.name & " to start")
 
 proc haltFromStore*(state: VmState, force: bool = false) =
-  let conn = openConnect(connectionUri(state.netMode))
+  let conn = openConnect(connectionUriFor(state.driver, state.netMode))
   defer: conn.close
 
   try:
@@ -592,7 +688,12 @@ proc haltFromStore*(state: VmState, force: bool = false) =
     discard
 
 proc reload*(config: SpinozaConfig, provision = false) =
-  let conn = openConnect(resolveConnUri(config.name))
+  let mode = config.network.netMode()
+  let isLxc =
+    when defined(linux): config.isContainer
+    else: false
+  let driver = if isLxc: "lxc" else: "qemu"
+  let conn = openConnect(connectionUriFor(driver, mode))
   defer: conn.close
 
   var spinny = newSpinny("Reloading " & config.name & "...", "dots", time = true)
@@ -625,9 +726,15 @@ proc reload*(config: SpinozaConfig, provision = false) =
   except LibvirtError:
     discard
 
-  let bpath = ensureOverlay(config.name, config.box)
+  let bpath =
+    when defined(linux):
+      if isLxc:
+        ensureContainerRoot(config.name, config.box)
+      else:
+        ensureOverlay(config.name, config.box)
+    else:
+      ensureOverlay(config.name, config.box)
 
-  let mode = config.network.netMode()
   let uuid =
     block:
       let existing = loadVm(config.name)
@@ -640,10 +747,19 @@ proc reload*(config: SpinozaConfig, provision = false) =
       let fwdMode = if mode == "shared": "nat" else: ""
       discard conn.ensureNetwork(subnet, fwdMode)
 
-  let dom = conn.defineDomainXML(domainXml(config, bpath, uuid, hostPort))
+  let domainXmlStr =
+    when defined(linux):
+      if isLxc:
+        lxcDomainXmlFromConfig(config, bpath, uuid)
+      else:
+        domainXml(config, bpath, uuid, hostPort)
+    else:
+      domainXml(config, bpath, uuid, hostPort)
+  let dom = conn.defineDomainXML(domainXmlStr)
   dom.create
   when defined(linux):
-    if isBridgedMode(mode) and connectionUri(mode) == "qemu:///system":
+    if isBridgedMode(mode) and not isLxc and
+        connectionUri(mode) == "qemu:///system":
       try: writeFile(vmLogPath(config.name), "") except: discard
       ensureLogFile(vmLogPath(config.name))
 
@@ -653,6 +769,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
       uuid: uuid,
       box: config.box,
       name: config.name,
+      driver: driver,
       memory: config.memory,
       cpus: config.cpus,
       netMode: mode,
@@ -690,7 +807,10 @@ proc reload*(config: SpinozaConfig, provision = false) =
     spinny.error("Timed out waiting for " & config.name & " to restart")
 
 proc reloadFromStore*(state: VmState) =
-  let conn = openConnect(connectionUri(state.netMode))
+  let isLxc =
+    when defined(linux): state.isContainer
+    else: false
+  let conn = openConnect(connectionUriFor(state.driver, state.netMode))
   defer: conn.close
 
   var spinny = newSpinny("Reloading " & state.name & "...", "dots", time = true)
@@ -723,7 +843,14 @@ proc reloadFromStore*(state: VmState) =
   except LibvirtError:
     discard
 
-  let bpath = ensureOverlay(state.name, state.box)
+  let bpath =
+    when defined(linux):
+      if isLxc:
+        ensureContainerRoot(state.name, state.box)
+      else:
+        ensureOverlay(state.name, state.box)
+    else:
+      ensureOverlay(state.name, state.box)
 
   when defined(linux):
     if isBridgedMode(state.netMode):
@@ -731,10 +858,19 @@ proc reloadFromStore*(state: VmState) =
       let fwdMode = if state.netMode == "shared": "nat" else: ""
       discard conn.ensureNetwork(subnet, fwdMode)
 
-  let dom = conn.defineDomainXML(domainXmlFromState(state, bpath))
+  let domainXmlStr =
+    when defined(linux):
+      if isLxc:
+        lxcDomainXmlFromState(state, bpath)
+      else:
+        domainXmlFromState(state, bpath)
+    else:
+      domainXmlFromState(state, bpath)
+  let dom = conn.defineDomainXML(domainXmlStr)
   dom.create
   when defined(linux):
-    if isBridgedMode(state.netMode) and connectionUri(state.netMode) == "qemu:///system":
+    if isBridgedMode(state.netMode) and not isLxc and
+        connectionUri(state.netMode) == "qemu:///system":
       try: writeFile(vmLogPath(state.name), "") except: discard
       ensureLogFile(vmLogPath(state.name))
   updateStatus(state.name, "running")
@@ -758,6 +894,12 @@ proc reloadFromStore*(state: VmState) =
     spinny.error("Timed out waiting for " & state.name & " to restart")
 
 proc suspend*(config: SpinozaConfig) =
+  let stored = loadVm(config.name)
+  if stored.isSome:
+    when defined(linux):
+      if stored.get().isContainer:
+        displayError(config.name & " is a container: suspend is not supported")
+        return
   let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
@@ -773,7 +915,11 @@ proc suspend*(config: SpinozaConfig) =
     displayError("Failed to suspend " & config.name)
 
 proc suspendFromStore*(state: VmState) =
-  let conn = openConnect(connectionUri(state.netMode))
+  when defined(linux):
+    if state.isContainer:
+      displayError(state.name & " is a container: suspend is not supported")
+      return
+  let conn = openConnect(connectionUriFor(state.driver, state.netMode))
   defer: conn.close
 
   try:
@@ -788,6 +934,12 @@ proc suspendFromStore*(state: VmState) =
     displayError("Failed to suspend " & state.name)
 
 proc resume*(config: SpinozaConfig) =
+  let stored = loadVm(config.name)
+  if stored.isSome:
+    when defined(linux):
+      if stored.get().isContainer:
+        displayError(config.name & " is a container: resume is not supported")
+        return
   let conn = openConnect(resolveConnUri(config.name))
   defer: conn.close
 
@@ -804,7 +956,11 @@ proc resume*(config: SpinozaConfig) =
     displayError("Failed to resume " & config.name)
 
 proc resumeFromStore*(state: VmState) =
-  let conn = openConnect(connectionUri(state.netMode))
+  when defined(linux):
+    if state.isContainer:
+      displayError(state.name & " is a container: resume is not supported")
+      return
+  let conn = openConnect(connectionUriFor(state.driver, state.netMode))
   defer: conn.close
 
   try:

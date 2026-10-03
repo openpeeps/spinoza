@@ -54,6 +54,8 @@ sudo apt-get install -y \
 
 # Runtime: libvirtd, dnsmasq (for NAT/DHCP), and iproute2
 sudo apt-get install -y libvirt-daemon-system dnsmasq-base net-tools
+# Runtime (only for `type: container`): the libvirt LXC driver
+sudo apt-get install -y libvirt-daemon-driver-lxc
 
 # Enable the libvirt daemon (socket activation is also sufficient)
 sudo systemctl enable --now libvirtd
@@ -109,7 +111,34 @@ QEMU is bundled with Spinoza on macOS via a TCG wrapper when KVM is unavailable.
 spinoza init
 ```
 
-This will interactively prompt for box name, VM name, memory, CPUs, SSH settings, and optional shared folders.
+Interactive mode opens with a dropdown of your installed boxes (`spinoza box.list`),
+then prompts for VM name, memory, CPUs, network mode, SSH settings, and optional
+shared folders. Container boxes are marked `(container)` and default to `shared`
+networking.
+
+Pass any value flag to skip the prompts entirely — useful for scripts:
+
+```bash
+# box is positional, everything else is a flag (note the `=`)
+spinoza init debian12 --name=web --memory=4096 --cpus=4 --network=shared \
+  --ssh-user=vagrant --ssh-password=vagrant
+
+# container from a rootfs box, two shared folders, overwrite existing file
+spinoza init debian12-lxc --name=web --type=container \
+  --shared-folder="$PWD/code:code,/home/me/data:data" --force
+```
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `<box>` (positional) | first installed box | Warns if the box isn't installed yet |
+| `--name` | `my-vm` | VM/container name |
+| `--memory` | `2048` | MB; validated against host RAM |
+| `--cpus` | `2` | |
+| `--network` | `user` (`shared` for containers) | `user`, `shared`, `host` |
+| `--ssh-user` / `--ssh-password` | `vagrant` | |
+| `--type` | inferred from the box | `vm`/`qemu` or `container`/`lxc` |
+| `--shared-folder` | – | `host/path,tag`, comma separated for several |
+| `--force` | – | Overwrite an existing Spinozafile |
 
 **2. Add a box image**
 
@@ -141,6 +170,7 @@ spinoza halt
 ```yaml
 box: debian-11                # Name of the qcow2 box image
 name: spinoza-debian          # Unique VM identifier
+type: vm                      # vm (default, QEMU/KVM) | container (Linux-only, libvirt LXC)
 memory: 2048                  # RAM in megabytes (min 1024)
 cpus: 2                       # Number of virtual CPUs
 network:
@@ -161,6 +191,73 @@ provision_script:             # Optional: local scripts piped to remote `bash -s
 ```
 
 Box images are stored in `~/.spinoza/boxes/`. VM state is tracked in `~/.spinoza/vms/`. Console logs are written to `~/.spinoza/logs/<name>.log`.
+
+## Linux Containers (libvirt LXC)
+
+On Linux, `type: container` boots a lightweight container via the libvirt
+LXC driver (`lxc:///system`) instead of a QEMU/KVM VM. The rest of the
+Spinozafile stays the same; `up`, `halt`, `reload`, `destroy`, `ssh`,
+`status`, `logs`, and `provision` all work. Differences:
+
+- Requires `network.mode: shared` or `host` (LXC has no userspace SLIRP).
+- `suspend` / `resume` are rejected for containers.
+- `shared_folders` become `<filesystem type='mount'>` bind-mounts at
+  `/mnt/<tag>` inside the container (no SSH remount step).
+- The `box:` name resolves to a **rootfs directory**, not a disk image:
+  `~/.spinoza/boxes/<box>/rootfs`. Each container gets a writable copy at
+  `~/.spinoza/vms/<name>-<box>-rootfs/`. Keep VM and container box names
+  distinct (e.g. `debian12` for VMs, `debian12-lxc` for containers).
+
+```yaml
+box: debian12-lxc
+name: web
+type: container
+memory: 1024
+cpus: 2
+network:
+  mode: shared
+ssh_config:
+  user: vagrant
+  password: vagrant
+```
+
+**Preparing a container box** (once per box, from the official
+`images.linuxcontainers.org` `default` variant build):
+
+```bash
+# 1. Resolve the latest build via the simplestreams index
+#    products["debian:bookworm:amd64:default"] -> versions -> root.tar.xz
+# 2. Download + verify the published SHA256, e.g.
+curl -LO https://images.linuxcontainers.org/images/debian/bookworm/amd64/default/<BUILD_ID>/rootfs.tar.xz
+echo "<SHA256>  rootfs.tar.xz" | sha256sum -c -
+# 3. Extract as root (preserves device nodes), then hand to your user
+sudo mkdir -p ~/.spinoza/boxes/debian12-lxc/rootfs
+sudo tar -xpf rootfs.tar.xz -C ~/.spinoza/boxes/debian12-lxc/rootfs
+sudo chown -R $(id -un): ~/.spinoza/boxes/debian12-lxc
+# 4. Add sshd + a login user (distrobuilder images ship neither).
+#    Without root, unpack the needed .debs on top of the rootfs:
+cd /tmp && for f in \
+  o/openssh/openssh-client_9.2p1-2+deb12u10_amd64.deb \
+  o/openssh/openssh-server_9.2p1-2+deb12u10_amd64.deb \
+  o/openssh/openssh-sftp-server_9.2p1-2+deb12u10_amd64.deb \
+  n/ncurses/ncurses-term_6.4-4_all.deb; do
+  curl -sL -O "http://deb.debian.org/debian/pool/main/$f"
+done
+R=~/.spinoza/boxes/debian12-lxc/rootfs
+for d in /tmp/*.deb; do dpkg-deb -x $d $R; done
+grep -q "^sshd:" $R/etc/passwd || echo "sshd:x:109:65534::/run/sshd:/usr/sbin/nologin" >> $R/etc/passwd
+grep -q "^sshd:" $R/etc/group || echo "sshd:x:109:" >> $R/etc/group
+grep -q "^sshd:" $R/etc/shadow || echo "sshd:*:19631:0:99999:7:::" >> $R/etc/shadow
+grep -q "^sshd:" $R/etc/gshadow || echo "sshd:!::" >> $R/etc/gshadow
+mkdir -p $R/run/sshd
+ssh-keygen -A -f $R
+ln -sfn /lib/systemd/system/ssh.service $R/etc/systemd/system/multi-user.target.wants/ssh.service
+# 5. Create the login user (password set via openssl hash or chroot/passwd as root)
+```
+
+Prerequisites on the host: `libvirt-daemon-driver-lxc`, working cgroup
+hierarchy (systemd + cgroupfs), and the usual `shared`-mode NAT network
+which Spinoza creates automatically.
 
 ## Provisioning
 

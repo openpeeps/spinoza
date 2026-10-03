@@ -66,6 +66,7 @@ type
   SpinozaConfig* = object
     box*: string
     name*: string
+    `type`*: string          ## "vm" (default, QEMU/KVM) | "container" (Linux-only, libvirt LXC)
     memory*: int
     cpus*: int
     network*: NetworkConfig
@@ -73,6 +74,14 @@ type
     shared_folders*: seq[SharedFolder]
     provision*: seq[string]         ## Inline shell commands, run in order over SSH
     provision_script*: seq[string]  ## Local script paths, piped to remote `bash -s`
+
+proc vmKind*(c: SpinozaConfig): string =
+  ## Normalized backend. Defaults to "vm".
+  let t = c.`type`.toLowerAscii()
+  if t.len == 0: "vm" else: t
+
+proc isContainer*(c: SpinozaConfig): bool =
+  c.vmKind() == "container"
 
 proc getHostRamMB*(): int =
   ## Get total host physical RAM in MB.
@@ -131,6 +140,19 @@ proc validateConfig*(config: SpinozaConfig) =
     raise newException(ValueError,
       "Invalid network.mode '" & mode &
       "' (expected: user, shared, or host)")
+
+  let kind = config.vmKind()
+  if kind notin ["vm", "container"]:
+    raise newException(ValueError,
+      "Invalid type '" & kind & "' (expected: vm or container)")
+  if kind == "container":
+    when not defined(linux):
+      raise newException(ValueError,
+        "type 'container' is only available on Linux (libvirt LXC driver)")
+    if mode == "user":
+      raise newException(ValueError,
+        "type 'container' requires network.mode 'shared' or 'host' " &
+        "(LXC has no userspace SLIRP networking)")
 
   for script in config.provision_script:
     if not fileExists(script):
