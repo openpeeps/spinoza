@@ -101,7 +101,7 @@ sudo port install libvirt libssh2
 QEMU is bundled with Spinoza on macOS via a TCG wrapper when KVM is unavailable.
 
 > [!NOTE]
-> Browse available boxes on [HashiCorp Cloud](https://portal.cloud.hashicorp.com). For example, [Generic Boxes](https://portal.cloud.hashicorp.com/vagrant/discover/generic) with libvirt support work seamlessly with Spinoza.
+> Browse available boxes on [HashiCorp Cloud](https://portal.cloud.hashicorp.com/vagrant/discover). For example, [Generic Boxes](https://portal.cloud.hashicorp.com/vagrant/discover/generic) with libvirt support work seamlessly with Spinoza.
 
 ## Quick Start
 
