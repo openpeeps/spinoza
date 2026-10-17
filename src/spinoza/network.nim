@@ -8,6 +8,9 @@
 import std/[os, osproc, strutils, times]
 import libvirt
 
+when defined(macosx):
+  import std/net
+
 # ------------------------------------------------------------------
 # Subnet and network name mapping
 # ------------------------------------------------------------------
@@ -100,6 +103,32 @@ proc normalizeMac*(m: string): string =
 # ------------------------------------------------------------------
 
 when defined(macosx):
+  proc vmnetSocketAlive*(socketPath: string): bool =
+    ## True when something actually listens on the socket_vmnet socket.
+    ## A path-exists check is insufficient: crashed daemons leave stale
+    ## socket files behind (connect then fails with ECONNREFUSED).
+    try:
+      var sock = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+      defer: sock.close()
+      sock.connectUnix(socketPath)
+      result = true
+    except OSError:
+      result = false
+
+  proc vmnetBroadcasts*(): seq[string] =
+    ## Broadcast addresses of local 192.168.x.x interfaces (the vmnet
+    ## bridges). Used to nudge ARP learning during IP discovery.
+    try:
+      for line in execProcess("ifconfig").splitLines():
+        let l = line.strip()
+        if l.startsWith("inet 192.168."):
+          let ip = l.split()[1]
+          let bcast = ip.rsplit('.', maxsplit = 1)[0] & ".255"
+          if bcast notin result:
+            result.add bcast
+    except OSError, IOError:
+      discard
+
   proc extractArpMac(line: string): string =
     let marker = line.find(" at ")
     if marker < 0:
@@ -112,8 +141,11 @@ when defined(macosx):
 
   proc discoverVmIp*(mac: string, timeoutSec = 150): string =
     ## Poll the host ARP table until an entry for `mac` shows up.
+    ## Every 10s without a hit, ping vmnet broadcast addresses to
+    ## trigger ARP learning (passive table reads alone can miss quiet guests).
     let deadline = now() + initDuration(seconds = timeoutSec)
     let wantMac = normalizeMac(mac)
+    var lastPing = now() - initDuration(seconds = 11)
     while now() < deadline:
       let outp = execProcess("arp -an")
       for line in outp.splitLines():
@@ -123,6 +155,13 @@ when defined(macosx):
           let endIdx = line.find(")")
           if startIdx >= 0 and endIdx > startIdx:
             return line[startIdx + 1 ..< endIdx]
+      if now() - lastPing >= initDuration(seconds = 10):
+        lastPing = now()
+        try:
+          for bcast in vmnetBroadcasts():
+            discard execShellCmd("ping -c1 -t1 " & bcast & " >/dev/null 2>&1")
+        except OSError, IOError:
+          discard
       sleep(1000)
     return ""
 

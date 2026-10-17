@@ -1,0 +1,44 @@
+# Spinoza example — emulated ARM64 VM (TCG) on x86_64 host
+# Box: generic_debian12_arm (~/.spinoza/boxes/generic_debian12_arm.img)
+# Equivalent manual QEMU:
+#   qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 2G \
+#     -drive file=generic_debian12_arm.img,format=qcow2
+# Under libvirt this maps to: arch aarch64, machine virt,
+# cpu cortex-a57, emulator qemu-system-aarch64, UEFI
+# (edk2-aarch64-code.fd + per-VM vars), TCG (virtType qemu).
+#
+# Usage:
+#   cd examples/arm
+#   spinoza up              # boots with shared networking (per-VM 192.168.105.x)
+#   spinoza ssh             # direct IP, no port-forward
+#   spinoza halt
+#
+# Notes:
+# - `arch: aarch64` selects emulation. `x86_64` (default) keeps KVM/pc.
+#   `arm64` is accepted as an alias.
+# - `shared` needs the socket_vmnet daemon (one-time setup):
+#     sudo port install socket_vmnet
+#     sudo port load socket_vmnet
+#   Without it, `up` fails fast with a pointer to the daemon log.
+#   (`user` mode works without any daemon but gives 127.0.0.1:port.)
+# - Guest serial console lands in ~/.spinoza/logs/spinoza-arm.log.
+#   ARM virt uses ttyAMA0; if logs stay empty enable
+#   console=ttyAMA0 once inside the guest.
+# - Domain XML for aarch64 (virt machine, cortex-a57, UEFI via
+#   edk2-aarch64-code.fd, TCG wrapper qemu-tcg-aarch64.sh) is generated
+#   from `arch:`. First boot under TCG takes several minutes;
+#   `up` waits up to 10 minutes for sshd.
+# - The stock generic_debian12_arm ESP has no BOOTAA64.EFI fallback,
+#   so a fresh box drops to the UEFI shell. One-time fix applied to
+#   the box image: EFI/BOOT/BOOTAA64.EFI copied from EFI/DEBIAN/GRUBAA64.EFI.
+
+box: generic_debian12_arm
+name: spinoza-arm
+arch: aarch64
+memory: 8048
+cpus: 6
+network:
+  mode: shared
+ssh_config:
+  user: vagrant
+  password: vagrant

@@ -18,6 +18,7 @@ type
     box*: string
     name*: string
     driver*: string         ## "qemu" (default) | "lxc"
+    arch*: string           ## "x86_64" (default) | "aarch64" (emulated via TCG)
     memory*: int
     cpus*: int
     netMode*: string
@@ -30,6 +31,17 @@ type
 
 proc isContainer*(s: VmState): bool =
   s.driver == "lxc"
+
+proc archNorm*(s: VmState): string =
+  ## Normalized guest arch. Defaults to "x86_64" (pre-arch entries).
+  let a = s.arch.toLowerAscii().strip()
+  case a
+  of "", "x86_64", "amd64": "x86_64"
+  of "aarch64", "arm64": "aarch64"
+  else: a
+
+proc isArm*(s: VmState): bool =
+  s.archNorm() == "aarch64"
 
 var store* {.threadvar.}: KvStore
   ## Thread-local so the desktop app can run VM actions on a worker
@@ -64,6 +76,7 @@ proc saveVm*(state: VmState) =
     "box": state.box,
     "name": state.name,
     "driver": state.driver,
+    "arch": state.arch,
     "memory": state.memory,
     "cpus": state.cpus,
     "net_mode": state.netMode,
@@ -92,6 +105,7 @@ proc loadVm*(name: string): Option[VmState] =
     box: node["box"].getStr,
     name: node["name"].getStr,
     driver: node{"driver"}.getStr("qemu"),
+    arch: node{"arch"}.getStr("x86_64"),
     memory: node["memory"].getInt.int,
     cpus: node["cpus"].getInt.int,
     netMode: node{"net_mode"}.getStr("user"),
@@ -121,6 +135,7 @@ proc listVms*(): seq[VmState] =
         box: node["box"].getStr,
         name: node["name"].getStr,
         driver: node{"driver"}.getStr("qemu"),
+        arch: node{"arch"}.getStr("x86_64"),
         memory: node["memory"].getInt.int,
         cpus: node["cpus"].getInt.int,
         netMode: node{"net_mode"}.getStr("user"),

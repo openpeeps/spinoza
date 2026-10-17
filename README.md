@@ -92,13 +92,17 @@ Install via [Homebrew](https://brew.sh) or [MacPorts](https://www.macports.org):
 
 ```bash
 # Homebrew
-brew install libvirt libssh2
+brew install libvirt libssh2 socket_vmnet
+sudo brew services start socket_vmnet
 
 # MacPorts
-sudo port install libvirt libssh2
+sudo port install libvirt libssh2 socket_vmnet
+sudo port load socket_vmnet
 ```
 
 QEMU is bundled with Spinoza on macOS via a TCG wrapper when KVM is unavailable.
+
+`socket_vmnet` is only needed for `shared`/`host` networking (per-VM `192.168.x.x` IPs); `user` mode works without it. Keep it updated (`brew upgrade socket_vmnet` / `sudo port selfupdate && sudo port upgrade socket_vmnet`) — stale versions fail with a `VMNET_FAILURE` loop, see the Networking troubleshooting below.
 
 > [!NOTE]
 > Browse available boxes on [HashiCorp Cloud](https://portal.cloud.hashicorp.com/vagrant/discover). For example, [Generic Boxes](https://portal.cloud.hashicorp.com/vagrant/discover/generic) with libvirt support work seamlessly with Spinoza.
@@ -171,6 +175,7 @@ spinoza halt
 box: debian-11                # Name of the qcow2 box image
 name: spinoza-debian          # Unique VM identifier
 type: vm                      # vm (default, QEMU/KVM) | container (Linux-only, libvirt LXC)
+arch: x86_64                  # x86_64 (default) | aarch64 (arm64 alias, emulated via TCG)
 memory: 2048                  # RAM in megabytes (min 1024)
 cpus: 2                       # Number of virtual CPUs
 network:
@@ -361,6 +366,14 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblock /usr/libexec/boot
 ```
 
 Daemon-side debug output goes to `/opt/local/var/log/socket_vmnet.log` (MacPorts) or `/var/log/socket_vmnet/stderr` (upstream/Homebrew launchd).
+
+**Daemon won't start (`VMNET_FAILURE` loop in the log, no IPs ever):** the Apple vmnet framework is refusing the interface. Spinoza fails fast with `socket_vmnet is not responding` instead of hanging at SSH wait. To recover:
+```bash
+sudo launchctl list | grep socket_vmnet   # loaded or crashing?
+sudo port unload socket_vmnet && sudo port load socket_vmnet
+tail -20 /opt/local/var/log/socket_vmnet.log   # expect 192.168.105.1, no VMNET_FAILURE
+```
+Other vmnet consumers (Lima, Docker Desktop, UTM) can hold the interface — stop them first. Still failing after `sudo port selfupdate && sudo port upgrade socket_vmnet`? Reboot; post-update framework states are the usual cause. Note a stale socket file alone proves nothing — Spinoza probes the daemon with a real connection.
 
 ### Linux networking: shared and host modes
 

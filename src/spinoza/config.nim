@@ -67,6 +67,7 @@ type
     box*: string
     name*: string
     `type`*: string          ## "vm" (default, QEMU/KVM) | "container" (Linux-only, libvirt LXC)
+    arch*: string            ## "x86_64" (default) | "aarch64" ("arm64" alias, emulated via TCG)
     memory*: int
     cpus*: int
     network*: NetworkConfig
@@ -82,6 +83,18 @@ proc vmKind*(c: SpinozaConfig): string =
 
 proc isContainer*(c: SpinozaConfig): bool =
   c.vmKind() == "container"
+
+proc archNorm*(c: SpinozaConfig): string =
+  ## Normalized guest arch. Defaults to "x86_64".
+  ## Accepts "arm64" as an alias for "aarch64".
+  let a = c.arch.toLowerAscii().strip()
+  case a
+  of "", "x86_64", "amd64": "x86_64"
+  of "aarch64", "arm64": "aarch64"
+  else: a
+
+proc isArm*(c: SpinozaConfig): bool =
+  c.archNorm() == "aarch64"
 
 proc getHostRamMB*(): int =
   ## Get total host physical RAM in MB.
@@ -145,6 +158,10 @@ proc validateConfig*(config: SpinozaConfig) =
   if kind notin ["vm", "container"]:
     raise newException(ValueError,
       "Invalid type '" & kind & "' (expected: vm or container)")
+  if config.archNorm() notin ["x86_64", "aarch64"]:
+    raise newException(ValueError,
+      "Invalid arch '" & config.arch &
+      "' (expected: x86_64, aarch64, or arm64)")
   if kind == "container":
     when not defined(linux):
       raise newException(ValueError,

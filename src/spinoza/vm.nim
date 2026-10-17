@@ -78,20 +78,47 @@ else
 fi
 """
 
-proc wrapperPath(): string =
+proc qemuBinaryForArch*(arch: string): string =
+  ## QEMU system emulator for a normalized arch ("x86_64" | "aarch64").
+  if arch == "aarch64": "qemu-system-aarch64"
+  else: "qemu-system-x86_64"
+
+proc edk2Aarch64Path*(): string =
+  ## Host UEFI firmware for ARM guests. Raises IOError when missing.
+  when defined(macosx):
+    const candidates = [
+      "/opt/local/share/qemu/edk2-aarch64-code.fd"
+    ]
+  else:
+    const candidates = [
+      "/usr/share/AAVMF/AAVMF_CODE.fd",
+      "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+      "/usr/share/qemu/edk2-aarch64-code.fd"
+    ]
+  for c in candidates:
+    if fileExists(c):
+      return c
+  raise newException(IOError,
+    "AArch64 UEFI firmware not found (tried: " & candidates.join(", ") & ").\n" &
+    "macOS: MacPorts qemu ships it. Linux: install e.g. AAVMF/edk2-aarch64.")
+
+proc wrapperPath*(arch: string = "x86_64"): string =
+  let qemuBinName = qemuBinaryForArch(arch)
   let p = getEnv("LIBVIRT_QEMUWrapper")
   if p.len > 0: p
   elif defined(macosx):
-    let wrapper = getHomeDir() / ".spinoza" / "qemu-tcg.sh"
+    let wrapperName =
+      if arch == "aarch64": "qemu-tcg-aarch64.sh" else: "qemu-tcg.sh"
+    let wrapper = getHomeDir() / ".spinoza" / wrapperName
     if not fileExists(wrapper):
-      let qemuBin = findExe("qemu-system-x86_64")
+      let qemuBin = findExe(qemuBinName)
       if qemuBin.len == 0:
-        raise newException(IOError, "qemu-system-x86_64 not found in PATH")
+        raise newException(IOError, qemuBinName & " not found in PATH")
       writeFile(wrapper, qemuTcgWrapper.replace("__QEMU_BIN__", qemuBin))
       discard execShellCmd("chmod +x " & wrapper)
     wrapper
   else:
-    findExe("qemu-system-x86_64")
+    findExe(qemuBinName)
 
 proc pathPresent(p: string): bool =
   ## True for any existing path (files, dirs, unix sockets).
@@ -117,23 +144,28 @@ proc hostSupportsKvm*(): bool =
   else:
     return false
 
-proc vmnetWrapperPath(socketPath: string): string =
+proc vmnetWrapperPath(socketPath: string, arch: string = "x86_64"): string =
   ## Emulator shim routing QEMU through socket_vmnet_client for vmnet modes.
+  let qemuBinName = qemuBinaryForArch(arch)
   when defined(macosx):
-    if not pathPresent(socketPath):
+    if not vmnetSocketAlive(socketPath):
       raise newException(IOError,
-        "socket_vmnet socket not found at " & socketPath & ".\n" &
-        "Start the daemon with: sudo port load socket_vmnet\n" &
+        "socket_vmnet is not responding at " & socketPath & ".\n" &
+        "The daemon may be stopped or crashing (check for VMNET_FAILURE).\n" &
+        "Try: sudo port unload socket_vmnet && sudo port load socket_vmnet\n" &
+        "then: tail /opt/local/var/log/socket_vmnet.log\n" &
         "(see the Networking section of the README)")
     let client = findExe("socket_vmnet_client")
     if client.len == 0:
       raise newException(IOError,
         "socket_vmnet_client not found in PATH.\n" &
         "Install it with: sudo port install socket_vmnet")
-    let qemuBin = findExe("qemu-system-x86_64")
+    let qemuBin = findExe(qemuBinName)
     if qemuBin.len == 0:
-      raise newException(IOError, "qemu-system-x86_64 not found in PATH")
-    let wrapper = getHomeDir() / ".spinoza" / "qemu-vmnet.sh"
+      raise newException(IOError, qemuBinName & " not found in PATH")
+    let wrapperName =
+      if arch == "aarch64": "qemu-vmnet-aarch64.sh" else: "qemu-vmnet.sh"
+    let wrapper = getHomeDir() / ".spinoza" / wrapperName
     writeFile(wrapper, qemuVmnetWrapper
       .replace("__VMNET_CLIENT__", client)
       .replace("__VMNET_SOCKET__", socketPath)
@@ -227,7 +259,10 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
   let mem = $(config.memory * 1024)
   let mode = config.network.netMode()
   let mac = deriveMac(vmUuid)
-  let useKvm = hostSupportsKvm()
+  let arch = config.archNorm()
+  let arm = arch == "aarch64"
+  # Cross-arch guests always emulate (TCG): KVM can only run host-arch code.
+  let useKvm = hostSupportsKvm() and not arm
   var d = LibvirtDomain(
     virtType: if useKvm: "kvm" else: "qemu",
     metadata: LibvirtMetadata(name: config.name),
@@ -235,18 +270,24 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
     currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
     vcpu: LibvirtVcpu(value: $config.cpus, placement: "static"),
     os: LibvirtOS(
-      osType: "hvm", arch: "x86_64", machine: "pc",
+      osType: "hvm",
+      arch: if arm: "aarch64" else: "x86_64",
+      machine: if arm: "virt" else: "pc",
+      # ARM virt images boot via UEFI (plain loader resolves to type rom;
+      # no per-VM NVRAM needed, keeping undefine/destroy flag-free).
+      loader: if arm: edk2Aarch64Path() else: "",
       boot: @[bdHardDisk]
     ),
+    cpu: LibvirtCpu(model: if arm: "cortex-a57" else: ""),
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
     emulator:
       when defined(macosx):
-        if isVmnetMode(mode): vmnetWrapperPath(config.network.resolveSocketPath())
-        else: wrapperPath()
+        if isVmnetMode(mode): vmnetWrapperPath(config.network.resolveSocketPath(), arch)
+        else: wrapperPath(arch)
       else:
-        wrapperPath(),
+        wrapperPath(arch),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
@@ -287,7 +328,9 @@ proc domainXml*(config: SpinozaConfig, boxPath: string,
         d.qemuArgs.add "-fsdev"
         d.qemuArgs.add "local,path=" & f.host & ",id=" & fsId & ",security_model=none"
         d.qemuArgs.add "-device"
-        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag & ",addr=0x8"
+        # ARM virt uses PCIe: leave address assignment to QEMU.
+        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag &
+          (if arm: "" else: ",addr=0x8")
   else:
     if config.shared_folders.len > 0:
       d.memoryBacking = LibvirtMemoryBacking(sourceType: "memfd", accessMode: "shared")
@@ -358,6 +401,22 @@ proc cleanup*(conn: Connect, domainName: string) =
   except LibvirtError:
     discard
 
+proc startDomain(dom: auto, mode, name: string) =
+  ## Start a defined domain. Immediate QEMU failures (e.g. a dead
+  ## socket_vmnet behind fd=3) surface here, not after minutes of
+  ## SSH polling, so turn them into actionable errors.
+  try:
+    dom.create
+  except LibvirtError as e:
+    var hint = "Check the guest log at " & vmLogPath(name) &
+      " for the QEMU error.\nOriginal error: " & e.msg
+    if isVmnetMode(mode):
+      hint = "Shared/host networking failed at start. Is socket_vmnet running?\n" &
+        "Try: sudo port unload socket_vmnet && sudo port load socket_vmnet\n" &
+        "then: tail /opt/local/var/log/socket_vmnet.log\n" &
+        "Original error: " & e.msg
+    raise newException(IOError, "Failed to start " & name & ".\n" & hint)
+
 proc autoMountSharedFolders(host: string, port: int, user, pass: string,
                             folders: seq[SharedFolder]) =
   ## Mount configured shared folders inside the guest over SSH.
@@ -395,6 +454,11 @@ proc waitUntilReady(spinny: ptr Spinny, name: string, host: string,
     if not lf.isNil: lf.close()
 
   result = sshModule.probeSsh(host, port, user, pass, timeoutSec, onWait)
+
+proc sshTimeout*(isArm: bool): int =
+  ## SSH readiness timeout. TCG-emulated ARM guests take several
+  ## minutes to reach sshd; native guests boot in seconds.
+  if isArm: 600 else: 120
 
 proc resolveEndpoint(mode, name, uuid: string,
                      forwardedPort: int): tuple[host: string, port: int] =
@@ -455,7 +519,7 @@ proc up*(config: SpinozaConfig, provision = false) =
       domainXml(config, ensureOverlay(config.name, config.box),
         uuid, hostPort)
   let dom = conn.defineDomainXML(domainXmlStr)
-  dom.create
+  startDomain(dom, mode, config.name)
   when defined(linux):
     if isBridgedMode(mode) and not isLxc and
         connectionUri(mode) == "qemu:///system":
@@ -467,6 +531,7 @@ proc up*(config: SpinozaConfig, provision = false) =
     box: config.box,
     name: config.name,
     driver: driver,
+    arch: config.archNorm(),
     memory: config.memory,
     cpus: config.cpus,
     netMode: mode,
@@ -492,7 +557,7 @@ proc up*(config: SpinozaConfig, provision = false) =
     spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
 
   let vmReady = waitUntilReady(addr spinny, config.name, host, port,
-    config.ssh_config.user, config.ssh_config.password)
+    config.ssh_config.user, config.ssh_config.password, sshTimeout(config.isArm()))
 
   if vmReady:
     if not isLxc:
@@ -505,7 +570,8 @@ proc up*(config: SpinozaConfig, provision = false) =
         config.provision, config.provision_script)
       if not ok: return
       spinny.setText("Provisioning complete")
-    spinny.success(config.name & " is ready on " & host & ":" & $port)
+    spinny.success(config.name & " is ready: ssh -p " & $port & " " &
+      config.ssh_config.user & "@" & host)
   else:
     spinny.error("Timed out waiting for " & config.name & " to start")
 
@@ -543,7 +609,9 @@ proc status*(config: SpinozaConfig) =
 proc domainXmlFromState*(state: VmState, boxPath: string): string =
   let mem = $(state.memory * 1024)
   let mac = deriveMac(state.uuid)
-  let useKvm = hostSupportsKvm()
+  let arch = state.archNorm()
+  let arm = arch == "aarch64"
+  let useKvm = hostSupportsKvm() and not arm
   var d = LibvirtDomain(
     virtType: if useKvm: "kvm" else: "qemu",
     metadata: LibvirtMetadata(name: state.name),
@@ -551,18 +619,22 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
     currentMemory: LibvirtMemory(value: mem, unit: "KiB"),
     vcpu: LibvirtVcpu(value: $state.cpus, placement: "static"),
     os: LibvirtOS(
-      osType: "hvm", arch: "x86_64", machine: "pc",
+      osType: "hvm",
+      arch: if arm: "aarch64" else: "x86_64",
+      machine: if arm: "virt" else: "pc",
+      loader: if arm: edk2Aarch64Path() else: "",
       boot: @[bdHardDisk]
     ),
+    cpu: LibvirtCpu(model: if arm: "cortex-a57" else: ""),
     clock: LibvirtClock(offset: "utc"),
     events: LibvirtEvents(
       onPoweroff: oaDestroy, onReboot: oaRestart, onCrash: oaDestroy),
     emulator:
       when defined(macosx):
-        if isVmnetMode(state.netMode): vmnetWrapperPath(state.netMode.defaultSocketPath())
-        else: wrapperPath()
+        if isVmnetMode(state.netMode): vmnetWrapperPath(state.netMode.defaultSocketPath(), arch)
+        else: wrapperPath(arch)
       else:
-        wrapperPath(),
+        wrapperPath(arch),
     disks: @[LibvirtDisk(
       diskType: "file", device: "disk",
       driverName: "qemu", driverType: "qcow2",
@@ -602,7 +674,8 @@ proc domainXmlFromState*(state: VmState, boxPath: string): string =
         d.qemuArgs.add "-fsdev"
         d.qemuArgs.add "local,path=" & f.host & ",id=" & fsId & ",security_model=none"
         d.qemuArgs.add "-device"
-        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag & ",addr=0x8"
+        d.qemuArgs.add "virtio-9p-pci,fsdev=" & fsId & ",mount_tag=" & f.tag &
+          (if arm: "" else: ",addr=0x8")
   else:
     if state.sharedFolders.len > 0:
       d.memoryBacking = LibvirtMemoryBacking(sourceType: "memfd", accessMode: "shared")
@@ -641,7 +714,7 @@ proc upFromStore*(state: VmState) =
     else:
       domainXmlFromState(state, ensureOverlay(state.name, state.box))
   let dom = conn.defineDomainXML(domainXmlStr)
-  dom.create
+  startDomain(dom, state.netMode, state.name)
   when defined(linux):
     if isBridgedMode(state.netMode) and not isLxc and
         connectionUri(state.netMode) == "qemu:///system":
@@ -663,13 +736,14 @@ proc upFromStore*(state: VmState) =
     spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
 
   let vmReady = waitUntilReady(addr spinny, state.name, host, port,
-    state.sshUser, state.sshPass)
+    state.sshUser, state.sshPass, sshTimeout(state.isArm()))
 
   if vmReady:
     if not isLxc:
       autoMountSharedFolders(host, port, state.sshUser, state.sshPass,
         state.sharedFolders)
-    spinny.success(state.name & " is ready on " & host & ":" & $port)
+    spinny.success(state.name & " is ready: ssh -p " & $port & " " &
+      state.sshUser & "@" & host)
   else:
     spinny.error("Timed out waiting for " & state.name & " to start")
 
@@ -756,7 +830,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
     else:
       domainXml(config, bpath, uuid, hostPort)
   let dom = conn.defineDomainXML(domainXmlStr)
-  dom.create
+  startDomain(dom, mode, config.name)
   when defined(linux):
     if isBridgedMode(mode) and not isLxc and
         connectionUri(mode) == "qemu:///system":
@@ -770,6 +844,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
       box: config.box,
       name: config.name,
       driver: driver,
+      arch: config.archNorm(),
       memory: config.memory,
       cpus: config.cpus,
       netMode: mode,
@@ -794,7 +869,7 @@ proc reload*(config: SpinozaConfig, provision = false) =
   updateStatus(config.name, "running")
 
   let vmReady = waitUntilReady(addr spinny, config.name, host, port,
-    config.ssh_config.user, config.ssh_config.password)
+    config.ssh_config.user, config.ssh_config.password, sshTimeout(config.isArm()))
 
   if vmReady:
     if provision:
@@ -802,7 +877,8 @@ proc reload*(config: SpinozaConfig, provision = false) =
         config.ssh_config.user, config.ssh_config.password,
         config.provision, config.provision_script)
       if not ok: return
-    spinny.success(config.name & " reloaded and ready on " & host & ":" & $port)
+    spinny.success(config.name & " reloaded and ready: ssh -p " & $port & " " &
+      config.ssh_config.user & "@" & host)
   else:
     spinny.error("Timed out waiting for " & config.name & " to restart")
 
@@ -867,7 +943,7 @@ proc reloadFromStore*(state: VmState) =
     else:
       domainXmlFromState(state, bpath)
   let dom = conn.defineDomainXML(domainXmlStr)
-  dom.create
+  startDomain(dom, state.netMode, state.name)
   when defined(linux):
     if isBridgedMode(state.netMode) and not isLxc and
         connectionUri(state.netMode) == "qemu:///system":
@@ -886,10 +962,11 @@ proc reloadFromStore*(state: VmState) =
     spinny.setText("Waiting for SSH on " & host & ":" & $port & "...")
 
   let vmReady = waitUntilReady(addr spinny, state.name, host, port,
-    state.sshUser, state.sshPass)
+    state.sshUser, state.sshPass, sshTimeout(state.isArm()))
 
   if vmReady:
-    spinny.success(state.name & " reloaded and ready on " & host & ":" & $port)
+    spinny.success(state.name & " reloaded and ready: ssh -p " & $port & " " &
+      state.sshUser & "@" & host)
   else:
     spinny.error("Timed out waiting for " & state.name & " to restart")
 

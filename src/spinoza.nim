@@ -113,7 +113,10 @@ proc statusCommand*(v: Values) =
     echo "No VMs registered"
   else:
     for state in vms:
-      echo state.name & " (" & state.uuid[0..7] & "): " & state.status
+      let endpoint =
+        if state.sshHost.len > 0: " @ " & state.sshHost & ":" & $state.sshPort
+        else: ""
+      echo state.name & " (" & state.uuid[0..7] & "): " & state.status & endpoint
 
 proc boxAddCommand*(v: Values) =
   initSpinoza()
