@@ -92,15 +92,15 @@ Install via [Homebrew](https://brew.sh) or [MacPorts](https://www.macports.org):
 
 ```bash
 # Homebrew
-brew install libvirt libssh2 socket_vmnet
+brew install libvirt libssh2 qemu socket_vmnet
 sudo brew services start socket_vmnet
 
 # MacPorts
-sudo port install libvirt libssh2 socket_vmnet
+sudo port install libvirt libssh2 qemu socket_vmnet
 sudo port load socket_vmnet
 ```
 
-QEMU is bundled with Spinoza on macOS via a TCG wrapper when KVM is unavailable.
+QEMU provides the actual emulators (`qemu-system-x86_64`, `qemu-system-aarch64`). Spinoza routes them through a small TCG wrapper when hardware acceleration is unavailable.
 
 `socket_vmnet` is only needed for `shared`/`host` networking (per-VM `192.168.x.x` IPs); `user` mode works without it. Keep it updated (`brew upgrade socket_vmnet` / `sudo port selfupdate && sudo port upgrade socket_vmnet`) — stale versions fail with a `VMNET_FAILURE` loop, see the Networking troubleshooting below.
 
